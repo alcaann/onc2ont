@@ -1,0 +1,3 @@
+T1	TREATMENT 10 15	chemo
+T2	DISEASE 20 31	lung cancer
+R1	TREATS Arg1:T1 Arg2:T2  # Example Relation

@@ -1,0 +1,30 @@
+
+# Git files
+.git
+.gitignore
+
+# Python cache and virtual environment
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.env
+
+# Docker files themselves
+docker-compose.yml
+Dockerfile
+#entrypoint.sh
+.dockerignore
+
+# Local databases (if any were created)
+database/
+data/source/
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE / OS specific files
+.vscode/
+.idea/
+*.DS_Store

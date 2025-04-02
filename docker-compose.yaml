@@ -1,0 +1,72 @@
+# docker-compose.yaml
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15 # Use a specific PostgreSQL version
+    container_name: umls_postgres_db
+    volumes:
+      # Mount a named volume to persist database data across container restarts
+      - postgres_data:/var/lib/postgresql/data
+      # Optional: Mount init scripts if needed (e.g., to enable extensions like pg_trgm)
+      # Create db_init/01-enable-pgtrgm.sql with "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+      # - ./db_init:/docker-entrypoint-initdb.d
+    environment:
+      # These MUST match the values the Python app expects
+      POSTGRES_DB: umls_db
+      POSTGRES_USER: umls_user
+      # --- IMPORTANT: CHANGE THIS PASSWORD! ---
+      # Use environment variables on host or Docker secrets for production.
+      POSTGRES_PASSWORD: your_very_secure_password_here
+    ports:
+      # Map internal port 5432 to host port 5433 (avoids conflicts)
+      - "5433:5432"
+    networks:
+      - umls_net
+    # Healthcheck ensures the DB is ready before the app starts depending on it
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -q"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: . # Build from the current directory
+      dockerfile: Dockerfile # Using the Dockerfile we defined
+    container_name: umls_processor_app
+    environment:
+      # Pass database connection details to the Python app container
+      # Uses values defined in the 'db' service environment
+      POSTGRES_DB: umls_db
+      POSTGRES_USER: umls_user
+      # --- IMPORTANT: Use the SAME secure password as above! ---
+      POSTGRES_PASSWORD: your_very_secure_password_here
+      POSTGRES_HOST: db # Service name resolution via Docker Compose network
+      POSTGRES_PORT: 5432 # Internal PostgreSQL port
+      # Add any other environment variables your app might need
+      # PYTHONUNBUFFERED: 1 # Already set in Dockerfile
+    volumes:
+      # Mount the local UMLS source data as read-only into the container
+      # This path MUST match where your load_umls_to_pgsql.py script expects it
+      # Assumes your local machine has the data at ./data/source/umls/META
+      # Make sure this directory exists on your host machine before running 'docker-compose up'
+      - ./data/source/umls/META:/app/data/source/umls/META:ro
+      # Optional: Uncomment the next line for development to mount your local code
+      # This allows you to see code changes without rebuilding the image.
+      # Remove or comment out for a "production" style run where code is baked into the image.
+      # - .:/app:rw
+    networks:
+      - umls_net
+    depends_on:
+      db:
+        condition: service_healthy # Waits for db healthcheck to pass
+    stdin_open: true # Keep stdin open for interactive shells (e.g., CMD ["bash"])
+    tty: true        # Allocate a pseudo-TTY for interactive shells
+
+networks:
+  umls_net:
+    driver: bridge # Use the default bridge network driver
+
+volumes:
+  postgres_data: # Define the named volume used by the 'db' service for data persistence

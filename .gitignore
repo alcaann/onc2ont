@@ -1,1 +1,29 @@
-model/venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.env
+
+# Docker / Build artifacts (if any)
+# (No specific build artifacts here usually)
+
+# Databases (local copies if ever created)
+database/
+*.db
+*.sqlite
+*.sqlite3
+
+# OS / IDE specific
+.vscode/
+.idea/
+*.DS_Store
+
+# Large Source Data (Highly Recommended - assumes data is downloaded separately)
+# If you MUST keep data/source in git, remove this line, but beware of repo size.
+data/source/
+
+# Git files
+.git
