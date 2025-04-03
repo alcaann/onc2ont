@@ -6,10 +6,8 @@ services:
     image: postgres:15 # Use a specific PostgreSQL version
     container_name: umls_postgres_db
     volumes:
-      # --- THIS LINE ENABLES PERSISTENCE ---
-      # Mount a named volume 'postgres_data' to persist database data
+      # Mount a named volume to persist database data across container restarts
       - postgres_data:/var/lib/postgresql/data
-      # --------------------------------------
       # Optional: Mount init scripts if needed (e.g., to enable extensions like pg_trgm)
       # Create db_init/01-enable-pgtrgm.sql with "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
       # - ./db_init:/docker-entrypoint-initdb.d
@@ -17,7 +15,8 @@ services:
       # These MUST match the values the Python app expects
       POSTGRES_DB: umls_db
       POSTGRES_USER: umls_user
-      # --- IMPORTANT: Use a secure method (env vars, secrets) for production ---
+      # --- IMPORTANT: CHANGE THIS PASSWORD! ---
+      # Use environment variables on host or Docker secrets for production.
       POSTGRES_PASSWORD: your_very_secure_password_here
     ports:
       # Map internal port 5432 to host port 5433 (avoids conflicts)
@@ -37,25 +36,26 @@ services:
       dockerfile: Dockerfile # Using the Dockerfile we defined
     container_name: umls_processor_app
     environment:
-      #LOG_LEVEL: DEBUG # Uncomment to set the logging level for the Python app
+      #LOG_LEVEL: DEBUG # Set the logging level for the Python app
       # Pass database connection details to the Python app container
       # Uses values defined in the 'db' service environment
       POSTGRES_DB: umls_db
       POSTGRES_USER: umls_user
-      # --- IMPORTANT: Use the SAME password as above! ---
+      # --- IMPORTANT: Use the SAME secure password as above! ---
       POSTGRES_PASSWORD: your_very_secure_password_here
-      # Renamed POSTGRES_HOST to DB_HOST to match db_utils.py expectation (using getenv('DB_HOST', 'db'))
-      DB_HOST: db # Service name resolution via Docker Compose network
-      # Renamed POSTGRES_PORT to DB_PORT to match db_utils.py expectation (using getenv('DB_PORT', '5432'))
-      DB_PORT: 5432 # Internal PostgreSQL port
+      POSTGRES_HOST: db # Service name resolution via Docker Compose network
+      POSTGRES_PORT: 5432 # Internal PostgreSQL port
       # Add any other environment variables your app might need
       # PYTHONUNBUFFERED: 1 # Already set in Dockerfile
     volumes:
       # Mount the local UMLS source data as read-only into the container
+      # This path MUST match where your load_umls_to_pgsql.py script expects it
       # Assumes your local machine has the data at ./data/source/umls/META
+      # Make sure this directory exists on your host machine before running 'docker-compose up'
       - ./data/source/umls/META:/app/data/source/umls/META:ro
-      # Optional: Mount local code for development (changes reflect without rebuild)
-      # Comment out for "production" style runs.
+      # Optional: Uncomment the next line for development to mount your local code
+      # This allows you to see code changes without rebuilding the image.
+      # Remove or comment out for a "production" style run where code is baked into the image.
       - .:/app:rw
     networks:
       - umls_net
@@ -69,7 +69,5 @@ networks:
   umls_net:
     driver: bridge # Use the default bridge network driver
 
-# --- THIS DECLARES THE NAMED VOLUME ---
 volumes:
   postgres_data: # Define the named volume used by the 'db' service for data persistence
-# --------------------------------------

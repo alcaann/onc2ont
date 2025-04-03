@@ -1,8 +1,17 @@
+# --- START OF FILE db_utils.py ---
+
 # /app/scripts/db_utils.py
 import os
 import psycopg2
 import sys
-# DO NOT import anything from db_setup or load_umls_to_pgsql here
+import logging # Import logging
+
+# Configure logging
+# You might want to configure this globally in your main app entry point eventually
+# For now, basic config here is okay for direct script execution.
+logging.basicConfig(level=os.getenv('LOG_LEVEL', 'INFO'), # Default to INFO, can be set via env var
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__) # Get logger for this module
 
 # --- Database Configuration (Read directly from environment) ---
 DB_NAME = os.getenv('POSTGRES_DB', 'umls_db')
@@ -12,13 +21,17 @@ DB_HOST = os.getenv('DB_HOST', 'db')
 DB_PORT = os.getenv('DB_PORT', '5432')
 
 if not DB_PASSWORD:
-    print("Error: POSTGRES_PASSWORD environment variable not set.", file=sys.stderr)
+    logger.error("FATAL: POSTGRES_PASSWORD environment variable not set.")
     # Decide how to handle this - exit or let connection fail later?
-    # sys.exit(1) # Or maybe just print warning and return None below
+    # Consider raising an exception or exiting if this is critical
+    # sys.exit(1)
 
 def get_db_connection():
     """Establishes a connection to the PostgreSQL database."""
     conn = None
+    if not DB_PASSWORD: # Prevent connection attempt if password missing
+        logger.error("Cannot connect to DB: POSTGRES_PASSWORD not set.")
+        return None
     try:
         conn = psycopg2.connect(
             dbname=DB_NAME,
@@ -27,131 +40,178 @@ def get_db_connection():
             host=DB_HOST,
             port=DB_PORT
         )
-        # Optional: print("DB connection successful in db_utils")
+        logger.debug("DB connection successful in db_utils")
         return conn
     except psycopg2.OperationalError as e:
-        print(f"Error connecting to database in db_utils: {e}", file=sys.stderr)
-        # Print details used, hiding password
-        print(f"  Attempted connection to: host={DB_HOST}, port={DB_PORT}, dbname={DB_NAME}, user={DB_USER}", file=sys.stderr)
+        logger.error(f"Error connecting to database in db_utils: {e}")
+        # Log details used, hiding password
+        logger.error(f"  Attempted connection to: host={DB_HOST}, port={DB_PORT}, dbname={DB_NAME}, user={DB_USER}")
         return None
     except Exception as e:
-        print(f"An unexpected error occurred getting DB connection in db_utils: {e}", file=sys.stderr)
+        logger.error(f"An unexpected error occurred getting DB connection in db_utils: {e}")
         return None
 
-# --- Other Database Utility Functions ---
+# --- Database Utility Functions ---
 
-def find_concept_by_term_and_source(term, source_vocab='SNOMEDCT_US', exact_match=True):
+# MODIFIED FUNCTION
+def find_concept_by_term_and_source(term: str,
+                                    source_sab: str, # Renamed from source_vocab for clarity
+                                    exact_match: bool = True,
+                                    case_sensitive: bool = False,
+                                    limit: int = 5): # Added limit parameter
     """
-    Finds UMLS concepts (CUI) matching a given term string,
-    optionally filtering by source vocabulary (SAB).
-    Uses case-insensitive search by default if exact_match is False.
-    """
-    conn = get_db_connection()
-    if conn is None:
-        return [] # Return empty list if connection failed
+    Finds concepts in MRCONSO by term, filtering by source vocabulary (SAB).
 
+    Args:
+        term: The term string to search for.
+        source_sab: The source abbreviation (SAB) to filter by (e.g., 'SNOMEDCT_US').
+        exact_match: If True, looks for an exact match. If False, uses LIKE.
+        case_sensitive: If True, matching is case-sensitive. Default False.
+        limit: Maximum number of results to return.
+
+    Returns:
+        A list of tuples, where each tuple is (cui, matched_term, code).
+        Returns an empty list if no match or error.
+    """
+    conn = None
     results = []
     try:
-        with conn.cursor() as cur:
-            # Use lower() and LIKE for case-insensitive partial match
-            # Use = for case-sensitive exact match (adjust index usage accordingly)
-            if exact_match:
-                query = """
-                    SELECT DISTINCT CUI, STR, SAB, CODE
-                    FROM mrconso
-                    WHERE STR = %s AND SAB = %s;
-                """
-                params = (term, source_vocab)
-            else:
-                # Uses the GIN index idx_mrconso_str_lower if created
-                query = """
-                    SELECT DISTINCT CUI, STR, SAB, CODE
-                    FROM mrconso
-                    WHERE lower(STR) = lower(%s) AND SAB = %s;
-                """
-                # Or for partial match:
-                # query = """
-                #     SELECT DISTINCT CUI, STR, SAB, CODE
-                #     FROM mrconso
-                #     WHERE lower(STR) LIKE lower(%s) AND SAB = %s;
-                # """
-                # params = (f"%{term}%", source_vocab) # for partial match
-                params = (term, source_vocab) # for case-insensitive exact match
+        conn = get_db_connection()
+        if not conn:
+            return results # Return empty list if connection failed
 
-            # print(f"Executing query: {cur.mogrify(query, params)}") # Debug print
-            cur.execute(query, params)
-            rows = cur.fetchall()
-            for row in rows:
-                results.append({
-                    'CUI': row[0],
-                    'MatchedTerm': row[1],
-                    'Source': row[2],
-                    'SourceCode': row[3]
-                })
+        with conn.cursor() as cur:
+            # Basic sanitization (consider more robust methods if needed)
+            term_param = term.strip()
+            sab_param = source_sab.strip()
+
+            # Build the WHERE clause based on parameters
+            if exact_match:
+                if case_sensitive:
+                    sql = """
+                        SELECT cui, str, code
+                        FROM mrconso
+                        WHERE str = %s AND sab = %s AND lat = 'ENG'
+                        LIMIT %s;
+                    """
+                    params = (term_param, sab_param, limit)
+                else:
+                    # Use LOWER() for case-insensitive exact match
+                    sql = """
+                        SELECT cui, str, code
+                        FROM mrconso
+                        WHERE LOWER(str) = LOWER(%s) AND sab = %s AND lat = 'ENG'
+                        LIMIT %s;
+                    """
+                    params = (term_param, sab_param, limit)
+            else: # Partial match (LIKE)
+                term_param_like = f"%{term_param}%" # Add wildcards for LIKE
+                if case_sensitive: # Less common for LIKE search
+                     sql = """
+                        SELECT cui, str, code
+                        FROM mrconso
+                        WHERE str LIKE %s AND sab = %s AND lat = 'ENG'
+                        LIMIT %s;
+                    """
+                     params = (term_param_like, sab_param, limit)
+                else:
+                     # Use LOWER() for case-insensitive partial match
+                     sql = """
+                        SELECT cui, str, code
+                        FROM mrconso
+                        WHERE LOWER(str) LIKE LOWER(%s) AND sab = %s AND lat = 'ENG'
+                        LIMIT %s;
+                    """
+                     params = (term_param_like, sab_param, limit)
+
+            logger.debug(f"Executing SQL: {cur.mogrify(sql, params).decode('utf-8')}") # Decode for clean logging
+            cur.execute(sql, params)
+            # Fetch results directly as tuples, matching process_phrase.py expectation
+            results = cur.fetchall()
+
     except psycopg2.Error as e:
-        print(f"Database query error in find_concept_by_term_and_source: {e}", file=sys.stderr)
-        conn.rollback() # Rollback on error
+        logger.error(f"Database error in find_concept_by_term_and_source: {e}")
+        # Optional: rollback if using transactions: if conn: conn.rollback()
     except Exception as e:
-         print(f"Unexpected error in find_concept_by_term_and_source: {e}", file=sys.stderr)
+        logger.error(f"Unexpected error in find_concept_by_term_and_source: {e}")
     finally:
         if conn:
             conn.close()
+    logger.debug(f"Found {len(results)} concepts for term '{term}' with SAB '{source_sab}'")
     return results
 
-def get_semantic_types_for_cui(cui):
-    """Retrieves semantic types (TUI and STY name) for a given CUI."""
-    conn = get_db_connection()
-    if conn is None:
-        return []
+# MODIFIED FUNCTION
+def get_semantic_types_for_cui(cui: str):
+    """
+    Retrieves semantic types (TUI and STY name) for a given CUI.
 
+    Args:
+        cui: The Concept Unique Identifier (CUI).
+
+    Returns:
+        A list of tuples, where each tuple is (tui, type_name).
+        Returns an empty list if no types found or error.
+    """
+    conn = None # Initialize conn to None
     results = []
     try:
+        conn = get_db_connection()
+        if not conn:
+            return []
+
         with conn.cursor() as cur:
             query = """
                 SELECT TUI, STY
                 FROM mrsty
                 WHERE CUI = %s;
             """
+            logger.debug(f"Executing SQL: {cur.mogrify(query, (cui,)).decode('utf-8')}")
             cur.execute(query, (cui,))
-            rows = cur.fetchall()
-            for row in rows:
-                results.append({
-                    'TUI': row[0],
-                    'SemanticType': row[1]
-                })
+            # Fetch results directly as tuples, matching process_phrase.py expectation
+            results = cur.fetchall()
     except psycopg2.Error as e:
-        print(f"Database query error in get_semantic_types_for_cui: {e}", file=sys.stderr)
-        conn.rollback()
+        logger.error(f"Database query error in get_semantic_types_for_cui for CUI {cui}: {e}")
+        # Optional: if conn: conn.rollback()
     except Exception as e:
-         print(f"Unexpected error in get_semantic_types_for_cui: {e}", file=sys.stderr)
+         logger.error(f"Unexpected error in get_semantic_types_for_cui for CUI {cui}: {e}")
     finally:
         if conn:
             conn.close()
+    logger.debug(f"Found {len(results)} semantic types for CUI {cui}")
     return results
 
 # --- Add a main block for testing db_utils.py directly ---
+# UPDATED TEST BLOCK
 if __name__ == "__main__":
-    print("--- Testing db_utils functions ---")
+    logger.info("--- Testing db_utils functions ---")
 
     test_term = "Lung cancer"
-    print(f"\nSearching for term: '{test_term}' in SNOMEDCT_US (case-insensitive exact)")
-    concepts = find_concept_by_term_and_source(test_term, source_vocab='SNOMEDCT_US', exact_match=False)
+    test_sab = "SNOMEDCT_US"
+    logger.info(f"Searching for term: '{test_term}' in {test_sab} (case-insensitive exact)")
+    # Note: Changed exact_match to True and case_sensitive to False to match common use case
+    concepts = find_concept_by_term_and_source(term=test_term,
+                                               source_sab=test_sab,
+                                               exact_match=True,
+                                               case_sensitive=False)
 
     if concepts:
-        print("Found concepts:")
-        for concept in concepts:
-            print(f"  CUI: {concept['CUI']}, Term: {concept['MatchedTerm']}, Code: {concept['SourceCode']}")
-            cui_to_check = concept['CUI']
-            print(f"    Getting semantic types for CUI: {cui_to_check}")
-            sem_types = get_semantic_types_for_cui(cui_to_check)
+        print("Found concepts:") # Using print for direct test output clarity
+        # concepts is now list of tuples: (cui, matched_term, code)
+        for cui, matched_term, code in concepts:
+            print(f"  CUI: {cui}, Term: {matched_term}, Code: {code}")
+            print(f"    Getting semantic types for CUI: {cui}")
+            # sem_types is now list of tuples: (tui, type_name)
+            sem_types = get_semantic_types_for_cui(cui)
             if sem_types:
-                for st in sem_types:
-                    print(f"      TUI: {st['TUI']}, Type: {st['SemanticType']}")
+                for tui, type_name in sem_types:
+                    print(f"      TUI: {tui}, Type: {type_name}")
             else:
                 print("      No semantic types found.")
-            # Only check sem types for the first found concept for brevity
+            # Only check sem types for the first found concept for brevity in testing
             break
     else:
-        print(f"No concepts found for '{test_term}' in SNOMEDCT_US.")
+        print(f"No concepts found for '{test_term}' in {test_sab}.")
 
-    print("\n--- db_utils test finished ---")
+    logger.info("--- db_utils test finished ---")
+
+# --- END OF FILE db_utils.py ---

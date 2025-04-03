@@ -25,6 +25,7 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+
 # Copy the rest of the application code into the working directory
 # This includes scripts/, db_setup/, and data/ including source/
 # Ensure data/source/umls/META with RRF files is present before building!
@@ -41,6 +42,9 @@ USER appuser
 # The chmod +x needs to be done on the HOST before building,
 # but we can ensure it here too.
 RUN chmod +x /app/entrypoint.sh
+
+# Download the spaCy model during the build
+RUN python -m spacy download en_core_web_sm
 
 # Set the entrypoint script to run when the container starts
 ENTRYPOINT ["/app/entrypoint.sh"]
