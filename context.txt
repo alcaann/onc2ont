@@ -1,92 +1,126 @@
 --- START OF FILE context.txt ---
 
-**Project Goal:** Develop an AI pipeline for a thesis that takes short oncology patient phrases as input and outputs a list of **NCI Thesaurus (NCIt)** concepts and the detailed relationships between them, ultimately for visualization as an interactive knowledge graph in a web application. (Considered Radiation Oncology Ontology (ROO), but it's likely not directly in the loaded UMLS subset; integration is deferred unless strictly required).
+**Project Goal:** Develop an AI pipeline for a thesis that takes short oncology patient phrases as input and outputs a list of **NCI Thesaurus (NCIt)** concepts and the detailed relationships between them. The ultimate goal is visualization as an interactive knowledge graph in a web application. (Radiation Oncology Ontology (ROO) integration is deferred).
 
 **Environment & Data Setup:**
 
 1.  **Environment:** Dockerized using Docker Compose (`docker-compose.yml`).
 2.  **Services:**
-    *   `db`: PostgreSQL 15 (`umls_postgres_db`), using **persistent data storage** via a named Docker volume (`postgres_data`). Healthcheck enabled.
-    *   `app`: Python 3.10 (`umls_processor_app`) image built via `Dockerfile`. Runs as non-root user `appuser`.
+    *   `db`: PostgreSQL 15 (`umls_postgres_db`), using persistent data storage via Docker volume (`postgres_data`). Healthcheck enabled. Port 5432 mapped to host 5433 for external access if needed.
+    *   `app`: Python 3.10 (`umls_processor_app`) image built via `Dockerfile`. Runs as non-root user `appuser`. Port 5000 mapped to host 5000 (currently for potential `displacy` debugging, can be repurposed for web app).
 3.  **Data Handling & Status:**
-    *   **UMLS Subset:** Successfully loaded into the persistent PostgreSQL `db` service. Contains `MRCONSO` (terms/codes from many sources including **NCIt (SAB='NCI')** and SNOMED CT) and `MRSTY` (semantic types linked via CUI). Data confirmed to persist across container restarts.
-    *   **Database Connection:** `psycopg2-binary` used for DB connection from the `app` container. Connection details passed via environment variables.
+    *   **UMLS Subset:** Successfully loaded into the persistent PostgreSQL `db` service. Contains `MRCONSO` (terms/codes), `MRSTY` (semantic types), and `MRREL` (relationships) from UMLS. Includes **NCI Thesaurus (SAB='NCI')** data. Data confirmed to persist across container restarts. `pg_trgm` extension enabled for efficient text searching.
+    *   **Database Connection:** `psycopg2-binary` used for DB connection from `app`. Connection details passed via environment variables.
     *   **Source Data Mount:** Host UMLS RRF source (`./data/source/umls/META`) mounted read-only into `app` at `/app/data/source/umls/META`.
 
-**Core Pipeline Strategy (Current - Strategy 2):**
+**Core Pipeline Strategy (Current):**
 
-*   **NER:** Use **ScispaCy NER** (model `en_ner_bc5cdr_md`, installed via `requirements.txt`) to identify entity text spans and labels (e.g., "Melanoma", "DISEASE").
-*   **Term-to-Concept (TTC):** Use **Custom Database Lookup** targeting **NCI Thesaurus (SAB='NCI')**.
-    *   For each entity span from ScispaCy (`ent.text`), query `mrconso` using partial, case-insensitive matching (`find_concept_by_term_and_source` with `exact_match=False`, `source_sab='NCI'`).
-    *   Retrieve candidate concepts (CUI, NCIt term, NCIt Code).
-    *   Fetch semantic types from `mrsty` using the CUI (`get_semantic_types_for_cui`).
-    *   Filter candidates based on compatibility between the ScispaCy NER label and the retrieved UMLS semantic types (using `LABEL_TO_SEMANTIC_TYPES` map in `process_phrase.py`).
-    *   Select the best match (currently picks the first filtered match).
+The pipeline implemented in `scripts/process_phrase.py` follows these steps:
 
-**Key Scripts & File Descriptions:**
+1.  **NLP Processing:** The input phrase is processed by `spacy` using the `en_ner_bc5cdr_md` model (with default components including tagger, parser, ner).
+2.  **NER Concept Extraction:**
+    *   Entities are identified by the ScispaCy NER component (`doc.ents`).
+    *   For each NER entity (`ent.text`, `ent.label_`):
+        *   **Term-to-Concept (TTC):** Call `get_filtered_db_matches` to find matching NCIt concepts.
+            *   Queries `mrconso` (SAB='NCI') via `find_concept_by_term_and_source` (exact match preferred, falls back to partial).
+            *   Retrieves semantic types via `get_semantic_types_for_cui`.
+            *   Filters candidates based on explicit exclusions (`EXCLUDE_SEMANTIC_TYPES`) and compatibility between NER label and UMLS types (`LABEL_TO_SEMANTIC_TYPES`).
+            *   **Ranks** valid candidates using scoring (exact match bonus + `rapidfuzz` similarity).
+        *   Selects the top-ranked, non-duplicate concept for the phrase.
+3.  **Fallback Token-Based Concept Detection:**
+    *   Iterates through individual tokens in the `doc`.
+    *   Skips tokens that overlap with spans already processed by NER.
+    *   Skips tokens whose Part-of-Speech (POS) tag is not in `FALLBACK_POS_TAGS` (`NOUN`, `PROPN`, `ADJ`).
+    *   For remaining tokens (`token.text`):
+        *   **TTC (High Confidence):** Call `get_filtered_db_matches` (label="UNKNOWN").
+        *   Selects the top-ranked match *only if* its score meets a strict `FALLBACK_SCORE_THRESHOLD` (requiring exact match).
+        *   Adds the non-duplicate concept to the list.
+4.  **Relation Extraction (Hybrid Approach):**
+    *   If >= 2 concepts are found (from NER + Fallback):
+        *   Call `relation_extractor.extract_relations_hybrid(doc, final_concepts)`.
+        *   **Concept Filtering:** Excludes certain concepts based on CUI (`EXCLUDE_CUIS_FROM_RELATIONS`) or Semantic Type (`EXCLUDE_SEM_TYPES_FROM_RELATIONS` - currently minimal) before pairing.
+        *   **Rule-Based Attempt:** Calls `apply_dependency_rules` to check for relations based on syntactic patterns (prepositional phrases, verb mediation, adjectival modifiers, conjunctions, staging patterns) between pairs of eligible concept spans.
+        *   **KB Lookup Fallback:** If no rule matches a pair, calls `lookup_kb_relation` to query the `MRREL` table for known relationships (prioritizing NCI source, specific relation types).
+5.  **Output:** Returns a dictionary containing a list of identified `concepts` (with span info, CUI, code, types, score, source) and a list of extracted `relations` (subj/obj CUIs, relation label, source).
 
-*   **`docker-compose.yml`:** Defines the `db` and `app` services, network (`umls_net`), persistent volume (`postgres_data`), environment variables (DB connection details, passwords), and mounts source code/data. Includes `depends_on` with `service_healthy` condition.
-*   **`Dockerfile`:** Builds the `app` image: installs system dependencies (`postgresql-client`), Python requirements (`requirements.txt`), copies application code, sets up a non-root user (`appuser`), installs ScispaCy model (`en_ner_bc5cdr_md`), sets `entrypoint.sh`.
-*   **`requirements.txt`:** Lists Python dependencies, correctly pinned for compatibility: `psycopg2-binary`, `spacy==3.6.1`, `scispacy==0.5.3`, the ScispaCy model URL (`en_ner_bc5cdr_md`), and `rapidfuzz`. Simplified to let pip resolve transitive dependencies.
-*   **`entrypoint.sh`:** Container startup script. Waits for DB (`pg_isready`), checks if DB is populated (querying `mrconso` via `psql`) to avoid rerunning loader, checks for UMLS source files (`MRCONSO.RRF`, `MRSTY.RRF`), conditionally runs `load_umls_to_pgsql.py` if DB empty and source files exist, then executes the main container command (`CMD`).
-*   **`db_setup/load_umls_to_pgsql.py`:** Python script (run once initially or if DB empty by entrypoint) to connect to DB, create tables (`mrconso`, `mrsty`, etc.), and load data from UMLS RRF files using `COPY`.
-*   **`scripts/db_utils.py`:** Contains Python functions for database interaction:
-    *   `get_db_connection()`: Establishes connection using env vars.
-    *   `find_concept_by_term_and_source()`: Queries `mrconso` for terms, filtering by SAB, supporting exact/partial matching. Returns list of tuples `(cui, term, code)`.
-    *   `get_semantic_types_for_cui()`: Queries `mrsty` for semantic types for a given CUI. Returns list of tuples `(tui, type_name)`.
-*   **`scripts/process_phrase.py`:** **Core pipeline script.** Implements Strategy 2 (ScispaCy NER `en_ner_bc5cdr_md` + Custom DB TTC targeting `NCI`). Takes phrase, runs ScispaCy NER (`nlp(phrase)`), iterates through `doc.ents`. Calls helper `get_filtered_db_matches(ent.text, ent.label)` which performs DB lookup (`find_concept...`) and semantic filtering (`get_semantic_types...`). Selects best match (currently first), handles deduplication (`processed_cuis_in_phrase`), and returns list of final concepts (dictionaries with `text_span`, `matched_term`, `cui`, `code` (NCIt), `sem_types`). Includes example usage in `if __name__ == "__main__":`.
-*   **`scripts/align_annotations.py`:** (Likely Inactive in Core Pipeline) Probably used for aligning predicted annotations with gold-standard annotations for evaluation. **Needed only if quantitative evaluation against annotated data is performed.**
-*   **`scripts/parse_raw.py`:** (Likely Inactive in Core Pipeline) Probably used for parsing/extracting input phrases from a more raw data format (e.g., XML, raw notes). **Needed only if data preprocessing from such formats is required.**
-*   **`scripts/process_text.py`:** (Likely Inactive in Core Pipeline) Probably contained text cleaning routines or the previous NER/TTC implementation. **Superseded by `process_phrase.py` for the core extraction task.**
-
-**Folder Structure (Current):**
+**Folder Structure & File Descriptions:**
 
 ```
 .
 ├── data/
 │   └── source/
 │       └── umls/
-│           └── META/      # UMLS RRF files (mounted r/o to app)
+│           └── META/      # UMLS RRF files (MRCONSO, MRSTY, MRREL) (mounted r/o to app)
 ├── db_setup/
-│   └── load_umls_to_pgsql.py # UMLS subset loader script
+│   └── load_umls_to_pgsql.py # Python script to create tables and load UMLS subset (MRCONSO, MRSTY, MRREL) into PostgreSQL.
 ├── scripts/
-│   ├── db_utils.py       # DB query functions
-│   ├── process_phrase.py # Core processing logic (ScispaCy NER + Custom NCI TTC)
-│   ├── align_annotations.py # (Inactive - Evaluation)
-│   ├── parse_raw.py         # (Inactive - Preprocessing)
-│   └── process_text.py      # (Inactive - Old/Cleaning)
+│   ├── db_utils.py       # Database interaction functions.
+│   │   ├── get_db_connection(): Establishes PostgreSQL connection using env vars.
+│   │   ├── find_concept_by_term_and_source(): Queries MRCONSO for concepts matching a term string, filtering by SAB, supporting exact/partial, case-insensitive matching. Returns List[Tuple(cui, str, code)].
+│   │   ├── get_semantic_types_for_cui(): Queries MRSTY for semantic types (TUI, STY) for a given CUI. Returns List[Tuple(tui, sty)].
+│   │   └── get_relations_for_cui_pair(): Queries MRREL for relationships between two CUIs (both directions), allows filtering by SAB. Returns List[Dict].
+│   ├── process_phrase.py # Core pipeline orchestration script.
+│   │   ├── get_filtered_db_matches(): Finds, filters (by label/sem_type, exclusions), and ranks (exact match, fuzzy score) potential concept matches for a given text span. Returns sorted List[Dict].
+│   │   ├── overlaps(): Helper to check if two character spans overlap.
+│   │   └── process_phrase(): Main function taking a phrase string. Performs SpaCy NLP, NER concept extraction, fallback token concept detection, calls relation extraction, and returns final {'concepts': [...], 'relations': [...]}.
+│   ├── relation_extractor.py # Implements relation extraction logic.
+│   │   ├── map_concepts_to_spans(): Maps concept dictionaries (with offsets) back to SpaCy Span objects.
+│   │   ├── _get_token_context(): Helper to get lemmas of surrounding tokens.
+│   │   ├── apply_dependency_rules(): Implements rule-based RE using SpaCy dependency parse. Checks for prepositional attachments, verb mediations, modifiers, conjunctions, staging patterns. Returns Optional[Tuple(subj_cui, rel, obj_cui)].
+│   │   ├── select_best_kb_relation(): Filters and ranks relations found in MRREL based on SAB/RELA priority.
+│   │   ├── lookup_kb_relation(): Calls get_relations_for_cui_pair and select_best_kb_relation.
+│   │   └── extract_relations_hybrid(): Orchestrates RE. Filters concepts, calls apply_dependency_rules, calls lookup_kb_relation if no rule matches. Returns List[Dict].
+│   ├── align_annotations.py # (Inactive - Evaluation) Potential script for evaluation against gold standard.
+│   ├── parse_raw.py         # (Inactive - Preprocessing) Potential script for initial data parsing.
+│   └── process_text.py      # (Inactive - Old/Cleaning) Likely superseded.
 ├── templates/             # (Placeholder for Web App HTML)
 ├── static/                # (Placeholder for Web App CSS/JS)
 ├── .dockerignore
 ├── .gitignore
-├── docker-compose.yml
-├── Dockerfile
-├── entrypoint.sh
-└── requirements.txt
+├── docker-compose.yml   # Defines services (db, app), network, volume, environment variables, ports.
+├── Dockerfile             # Builds the Python 'app' service image, installs dependencies, copies code.
+├── entrypoint.sh          # Container startup script: Waits for DB, checks if DB populated (via flag/query), checks RRF files, runs loader script if needed, executes main CMD.
+└── requirements.txt       # Lists Python dependencies (psycopg2, spacy, scispacy, model URL, rapidfuzz).
 ```
 
 **Current Status & Achievements:**
 
-*   Docker environment stable with persistent database storage.
-*   UMLS subset (including NCIt) successfully loaded and verified.
-*   Entrypoint correctly handles DB readiness and prevents unnecessary data reloads.
-*   Dependency conflicts resolved; required packages (`spacy`, `scispacy`, model) installed.
-*   **Strategy 2 (ScispaCy NER + Custom DB TTC targeting NCI) is implemented and functional.**
-    *   ScispaCy NER model (`en_ner_bc5cdr_md`) successfully integrated.
-    *   Pipeline identifies entities using ScispaCy.
-    *   Pipeline queries the database for matching NCI concepts using partial matching.
-    *   Pipeline retrieves semantic types from the database.
-    *   Basic semantic type filtering (based on NER label) is implemented.
-    *   Script outputs identified NCI concepts (CUI, NCIt Code, Matched Term, Sem Types).
+*   Stable Docker environment with persistent PostgreSQL DB.
+*   UMLS subset (MRCONSO, MRSTY, MRREL including NCIt) successfully loaded and queryable.
+*   Robust entrypoint script handles DB readiness and prevents data reloads.
+*   Concept Identification pipeline implemented:
+    *   Integrates ScispaCy NER (`en_ner_bc5cdr_md`).
+    *   Uses efficient DB lookups (exact match first).
+    *   Applies semantic type filtering (label-based and exclusion list).
+    *   Ranks concepts effectively using `rapidfuzz` similarity scoring.
+    *   **Includes a token-based fallback mechanism that successfully identifies key concepts missed by NER.**
+*   Hybrid Relation Extraction pipeline implemented:
+    *   Filters concepts before pairing to reduce noise.
+    *   Attempts rule-based extraction using dependency parses.
+    *   Attempts KB lookup via `MRREL` as a fallback.
+    *   **Successfully extracts *some* relations via rules (staging, modifiers, PART_OF).**
+
+**Known Issues / Challenges:**
+
+1.  **Relation Rule Deficiencies:** The primary bottleneck. The current dependency-based rules in `relation_extractor.py` fail to correctly identify several common and important relations:
+    *   **Prepositional phrases:** Rules for `to`, `in`, `of` (indicating location, metastasis, history) are not reliably matching the parse structures.
+    *   **Conjunctions:** The rule for `and` (indicating association or treatment combinations) is not reliably firing.
+    *   **Verb phrases:** Logic for verbs like `include` doesn't capture all related concepts (e.g., second object in a conjunction).
+2.  **KB Lookup Limitations:** The `MRREL` lookups (even when restored) did not find explicit relations for many clinically relevant pairs within the prioritized sources (NCI, SNOMEDCT_US), highlighting the need for better rule-based interpretation.
+3.  **Multi-Token Fallback:** The current token-based fallback doesn't handle multi-word terms missed by NER (e.g., "Stage III").
+4.  **Negation/Context:** The pipeline does not currently handle negation (e.g., "Negative for fever") or other complex linguistic contexts.
 
 **Next Milestones / Immediate Focus:**
 
-1.  **Refine TTC / Filtering / Ranking (within `process_phrase.py`):**
-    *   Analyze the quality of the current partial matching + semantic filtering. Does it find correct concepts for complex oncology terms? Does it still include too much noise (e.g., very short/generic `matched_term` from the DB)?
-    *   Improve the selection logic in `get_filtered_db_matches` if multiple candidates pass the filter (e.g., rank by string similarity using `rapidfuzz` between `entity_text` and `matched_term`, prefer shorter/exact matches over broader partial matches).
-    *   Refine the `LABEL_TO_SEMANTIC_TYPES` mapping for better filtering accuracy based on observed results.
-    *   Consider adding basic negation handling (e.g., using `negspacy` - would require adding to requirements/Dockerfile).
-2.  **Implement Relation Extraction:** Design and implement logic to identify relationships between the extracted NCI concepts.
-3.  **Web Application Backend & Frontend:** Develop API and visualization.
+1.  **Web Application Implementation:**
+    *   **Backend API:** Develop a simple web server (e.g., using Flask or FastAPI) within the `app` container.
+        *   Create an endpoint (e.g., `/process`) that accepts a phrase string.
+        *   Calls the `process_phrase` function.
+        *   Returns the resulting dictionary (`{'concepts': [...], 'relations': [...]}`) as JSON.
+    *   **Frontend Visualization:** Create basic HTML/CSS/JavaScript files (in `templates`/`static`).
+        *   Fetch results from the backend API.
+        *   Use a JavaScript graph visualization library (e.g., Vis.js, Cytoscape.js, D3.js) to render the concepts as nodes and relations as edges.
+        *   Make the graph interactive (e.g., display concept details on node click).
+2.  **Defer Further RE Refinement:** Temporarily pause intensive debugging/refinement of the relation extraction rules (`relation_extractor.py`) until the basic web UI is functional. Acknowledge current RE limitations.
 
 --- END OF FILE context.txt ---
