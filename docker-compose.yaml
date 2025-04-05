@@ -1,5 +1,4 @@
-# docker-compose.yaml
-
+# --- START OF FILE docker-compose.yml ---
 services:
   db:
     image: postgres:15 # Use a specific PostgreSQL version
@@ -8,19 +7,21 @@ services:
       - postgres_data:/var/lib/postgresql/data
       # - ./db_init:/docker-entrypoint-initdb.d # Optional init scripts
     environment:
-      POSTGRES_DB: umls_db # Match app env
-      POSTGRES_USER: umls_user # Match app env
-      POSTGRES_PASSWORD: your_very_secure_password_here # Match app env
+      # Ensure these match the actual credentials used
+      POSTGRES_DB: ${POSTGRES_DB:-umls_db}
+      POSTGRES_USER: ${POSTGRES_USER:-umls_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_very_secure_password_here} # Use env var or Docker secrets for production
     ports:
       # Map internal DB port 5432 to host port 5433 (for external tools if needed)
       - "5433:5432"
     networks:
       - umls_net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -q"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -q || exit 1"] # Exit 1 on failure
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped # Optional: Restart policy
 
   app:
     build:
@@ -28,32 +29,35 @@ services:
       dockerfile: Dockerfile
     container_name: umls_processor_app
     environment:
-      # LOG_LEVEL: DEBUG
-      POSTGRES_DB: umls_db
-      POSTGRES_USER: umls_user
-      POSTGRES_PASSWORD: your_very_secure_password_here
+      LOG_LEVEL: ${LOG_LEVEL:-INFO} # Allow overriding log level via .env file or environment
+      POSTGRES_DB: ${POSTGRES_DB:-umls_db}
+      POSTGRES_USER: ${POSTGRES_USER:-umls_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_very_secure_password_here} # Use env var or Docker secrets for production
       DB_HOST: db
       DB_PORT: 5432 # App connects to DB internally on 5432
       # PYTHONUNBUFFERED: 1 # Set in Dockerfile
+      # PYTHONPATH: /app:/app/scripts # Set in Dockerfile
     volumes:
+      # Mount the source UMLS data read-only
       - ./data/source/umls/META:/app/data/source/umls/META:ro
-      - .:/app:rw # Mount local code for development
+      # Mount local code for development; remove for production builds
+      - .:/app:rw
     networks:
       - umls_net
     depends_on:
       db:
-        condition: service_healthy
-    # --- ADD THIS SECTION ---
+        condition: service_healthy # Wait for DB to be ready
     ports:
-      # Map host port 5000 to container port 5000 (for displacy.serve)
-      - "5000:5000"
-    # ------------------------
-    stdin_open: true
-    tty: true
+      # Map host port 8000 to container port 8000 (for the FastAPI app)
+      - "8000:8000"
+    # Override the default CMD from Dockerfile to run the FastAPI server
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped # Optional: Restart policy
 
 networks:
   umls_net:
     driver: bridge
 
 volumes:
-  postgres_data:
+  postgres_data: # Define the named volume for persistent DB data
+# --- END OF FILE docker-compose.yml ---

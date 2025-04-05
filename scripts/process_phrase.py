@@ -1,17 +1,10 @@
 # --- START OF FILE scripts/process_phrase.py ---
-# Based on the version that produced the 2025-04-05 07:39:09 output,
-# + Displacy block + Minimal log cleanup
-
 import spacy
 import scispacy
 import logging
 import os
-from typing import List, Dict, Tuple, Any, Set
-# <<< ADDED FOR VISUALIZATION >>>
-from spacy import displacy
-# import time # time.sleep might be useful if server closes too fast
-# <<< END ADDED FOR VISUALIZATION >>>
-
+from typing import List, Dict, Tuple, Any, Set, Callable, Optional # Added Callable, Optional
+# Removed displacy import
 
 # Import DB utils needed for concept extraction
 from db_utils import find_concept_by_term_and_source, get_semantic_types_for_cui
@@ -20,7 +13,7 @@ from relation_extractor import extract_relations_hybrid # Assuming relation_extr
 # Import rapidfuzz for string similarity scoring
 from rapidfuzz import fuzz
 
-# Configure logging
+# Configure logging (remains for backend logs)
 log_level_str = os.getenv('LOG_LEVEL', 'INFO').upper()
 log_level = getattr(logging, log_level_str, logging.INFO)
 logging.basicConfig(level=log_level,
@@ -29,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # --- Load the ScispaCy NER model ---
 SCISPACY_MODEL = "en_ner_bc5cdr_md"
+nlp = None # Initialize nlp to None
 try:
     # Load default components, including tagger and parser
     nlp = spacy.load(SCISPACY_MODEL)
@@ -38,10 +32,10 @@ try:
     if 'tagger' not in nlp.pipe_names: logger.warning("POS Tagger ('tagger') not found. Fallback/rules may be less accurate.")
 except OSError:
     logger.error(f"ScispaCy model '{SCISPACY_MODEL}' not found. Please ensure it's installed.")
-    nlp = None
+    # nlp remains None
 except Exception as e:
     logger.error(f"Error loading Spacy model '{SCISPACY_MODEL}': {e}", exc_info=True)
-    nlp = None
+    # nlp remains None
 
 
 # --- Configuration ---
@@ -62,6 +56,7 @@ def get_filtered_db_matches(entity_text: str, entity_label: str = "UNKNOWN") -> 
     Finds concepts in the DB (exact first, then partial), filters them based on
     semantic types, ranks them based on string similarity, and returns the
     ranked list.
+    (Internal logging uses logger, no need for client-facing logs here)
     """
     # logger.debug(f"Looking up term: '{entity_text}' (Label: {entity_label}) for SAB='{TARGET_SOURCE}'")
     db_results_exact = find_concept_by_term_and_source(
@@ -140,20 +135,29 @@ def overlaps(start1: int, end1: int, start2: int, end2: int) -> bool:
     return max(start1, start2) < min(end1, end2)
 
 
-def process_phrase(phrase: str) -> Dict[str, List[Dict[str, Any]]]:
+def process_phrase(phrase: str, log_func: Optional[Callable[[str], None]] = None) -> Dict[str, List[Dict[str, Any]]]:
     """
     Processes a phrase: identifies NCI concepts using primary NER + token-based fallback,
-    and extracts relationships between them.
+    and extracts relationships between them. Sends logs via optional log_func.
     """
     if not nlp:
-        logger.error("ScispaCy model not loaded. Cannot process phrase.")
+        error_msg = "ScispaCy model not loaded. Cannot process phrase."
+        logger.error(error_msg)
+        if log_func: log_func(f"ERROR: {error_msg}")
         return {'concepts': [], 'relations': []}
 
-    logger.info(f"Processing phrase: '{phrase}'")
+    if log_func: log_func(f"Processing phrase: '{phrase}'")
+    logger.info(f"Processing phrase: '{phrase}'") # Keep backend log
+
+    doc = None
     try:
+        if log_func: log_func("Starting NLP processing...")
         doc = nlp(phrase) # Keep this doc object for relation extraction
+        if log_func: log_func("NLP processing complete.")
     except Exception as e:
-        logger.error(f"Error during NLP processing for phrase '{phrase}': {e}", exc_info=True)
+        error_msg = f"Error during NLP processing for phrase '{phrase}': {e}"
+        logger.error(error_msg, exc_info=True)
+        if log_func: log_func(f"ERROR: {error_msg}")
         return {'concepts': [], 'relations': []}
 
     final_concepts = []
@@ -161,9 +165,12 @@ def process_phrase(phrase: str) -> Dict[str, List[Dict[str, Any]]]:
     processed_spans: List[Tuple[int, int]] = []
 
     ner_entities_log = [(ent.text, ent.label_, ent.start_char, ent.end_char) for ent in doc.ents]
-    logger.info(f"ScispaCy NER found entities: {ner_entities_log}")
+    if log_func: log_func(f"Found {len(ner_entities_log)} NER entities: {ner_entities_log}")
+    logger.info(f"ScispaCy NER found entities: {ner_entities_log}") # Keep backend log
 
     # --- Step 1: Concept Extraction from Primary NER ---
+    if log_func: log_func("Starting NER-based concept extraction...")
+    ner_concepts_found = 0
     for ent in doc.ents:
         entity_text = ent.text
         entity_label = ent.label_
@@ -172,13 +179,16 @@ def process_phrase(phrase: str) -> Dict[str, List[Dict[str, Any]]]:
         processed_spans.append((start_char, end_char)) # Add span regardless of match outcome
 
         try:
+            if log_func: log_func(f"  Looking up NER entity: '{entity_text}' ({entity_label})")
             ranked_db_matches = get_filtered_db_matches(entity_text, entity_label)
             if ranked_db_matches:
                 best_match = ranked_db_matches[0]
                 cui = best_match['cui']
                 score = best_match['score']
                 if cui not in processed_cuis_in_phrase:
-                    logger.info(f"[NER] Selected concept for '{entity_text}': CUI={cui}, Term='{best_match['matched_term']}' (Score: {score:.2f})")
+                    msg = f"[NER] Found concept for '{entity_text}': CUI={cui}, Term='{best_match['matched_term']}' (Score: {score:.2f})"
+                    if log_func: log_func(f"  {msg}")
+                    logger.info(msg) # Keep backend log
                     final_concepts.append({
                         "text_span": entity_text,
                         "start_char": start_char,
@@ -191,16 +201,20 @@ def process_phrase(phrase: str) -> Dict[str, List[Dict[str, Any]]]:
                         "source": "ner"
                     })
                     processed_cuis_in_phrase.add(cui)
+                    ner_concepts_found += 1
                 # else: logger.debug(f"[NER] Skipping CUI {cui} for entity '{entity_text}' as already added.") # Keep DEBUG logs commented
             # else: logger.info(f"[NER] No suitable NCI concept match found for entity '{entity_text}' ({entity_label}).")
         except Exception as e:
-            logger.error(f"Error processing NER entity '{entity_text}': {e}", exc_info=True)
+            error_msg = f"Error processing NER entity '{entity_text}': {e}"
+            logger.error(error_msg, exc_info=True)
+            if log_func: log_func(f"ERROR: {error_msg}")
 
-    logger.info(f"Primary NER concept extraction finished. Found {len(final_concepts)} concepts.")
-    # logger.debug(f"Processed spans by NER: {processed_spans}") # Keep DEBUG logs commented
+    msg = f"NER concept extraction finished. Found {ner_concepts_found} new concepts."
+    if log_func: log_func(msg)
+    logger.info(msg) # Keep backend log
 
     # --- Step 2: Fallback Concept Detection using Tokens ---
-    logger.info("Starting fallback concept detection using individual tokens...")
+    if log_func: log_func("Starting fallback concept detection using individual tokens...")
     fallback_concepts_found = 0
     try:
         for token in doc:
@@ -218,9 +232,6 @@ def process_phrase(phrase: str) -> Dict[str, List[Dict[str, Any]]]:
                  # logger.debug(f"Skipping token '{token_text}' due to irrelevant POS tag: {token_pos}")
                  continue
 
-            # Optional basic filtering
-            # if len(token_text) < 3 or not token_text.isalnum(): continue
-
             # logger.debug(f"Processing non-overlapping token: '{token_text}' (POS: {token_pos})")
             ranked_fallback_matches = get_filtered_db_matches(token_text, entity_label="UNKNOWN")
 
@@ -229,9 +240,11 @@ def process_phrase(phrase: str) -> Dict[str, List[Dict[str, Any]]]:
                 fallback_cui = best_fallback_match['cui']
                 fallback_score = best_fallback_match['score']
 
-                if fallback_score >= FALLBACK_SCORE_THRESHOLD:
+                if fallback_score >= FALLBACK_SCORE_THRESHOLD: # Strict fallback requires exact match score
                     if fallback_cui not in processed_cuis_in_phrase:
-                        logger.info(f"[Fallback] Selected concept for token '{token_text}': CUI={fallback_cui}, Term='{best_fallback_match['matched_term']}' (Score: {fallback_score:.2f})")
+                        msg = f"[Fallback] Found concept for token '{token_text}': CUI={fallback_cui}, Term='{best_fallback_match['matched_term']}' (Score: {fallback_score:.2f})"
+                        if log_func: log_func(f"  {msg}")
+                        logger.info(msg) # Keep backend log
                         final_concepts.append({
                             "text_span": token_text,
                             "start_char": token_start,
@@ -249,117 +262,57 @@ def process_phrase(phrase: str) -> Dict[str, List[Dict[str, Any]]]:
                     # else: logger.debug(f"[Fallback] Skipping CUI {fallback_cui} for token '{token_text}' as already added.")
                 # else: logger.debug(f"[Fallback] Match for '{token_text}' score ({fallback_score:.2f}) below threshold.")
     except Exception as e:
-         logger.error(f"Error during fallback token processing: {e}", exc_info=True)
+         error_msg = f"Error during fallback token processing: {e}"
+         logger.error(error_msg, exc_info=True)
+         if log_func: log_func(f"ERROR: {error_msg}")
 
-    logger.info(f"Fallback concept detection finished. Found {fallback_concepts_found} additional concepts.")
-    logger.info(f"Total concepts found after fallback: {len(final_concepts)}")
+    msg = f"Fallback concept detection finished. Found {fallback_concepts_found} additional concepts."
+    if log_func: log_func(msg)
+    logger.info(msg) # Keep backend log
+    msg = f"Total concepts found: {len(final_concepts)}"
+    if log_func: log_func(msg)
+    logger.info(msg)
 
     # --- Step 3: Relation Extraction (using combined concepts) ---
     extracted_relations = []
     parser_available = nlp and 'parser' in nlp.pipe_names
     if not parser_available:
-        logger.warning("Skipping relation extraction: parser component not available.")
+        warn_msg = "Skipping relation extraction: parser component not available."
+        logger.warning(warn_msg)
+        if log_func: log_func(f"WARNING: {warn_msg}")
 
     if len(final_concepts) >= 2 and parser_available:
-        logger.info("Starting relation extraction...")
+        if log_func: log_func("Starting relation extraction...")
+        logger.info("Starting relation extraction...") # Keep backend log
         try:
             # Sort concepts by start_char before passing - helps readability and potentially rules
             final_concepts.sort(key=lambda x: x['start_char'])
             extracted_relations = extract_relations_hybrid(doc, final_concepts) # Pass the original doc
-            logger.info(f"Relation extraction finished. Found {len(extracted_relations)} relations.")
+            msg = f"Relation extraction finished. Found {len(extracted_relations)} relations."
+            if log_func: log_func(msg)
+            logger.info(msg) # Keep backend log
         except ImportError:
-             logger.error("Could not import 'extract_relations_hybrid'.", exc_info=True)
+             error_msg = "Could not import 'extract_relations_hybrid'."
+             logger.error(error_msg, exc_info=True)
+             if log_func: log_func(f"ERROR: {error_msg}")
         except Exception as e:
-            logger.error(f"An error occurred during relation extraction: {e}", exc_info=True)
+            error_msg = f"An error occurred during relation extraction: {e}"
+            logger.error(error_msg, exc_info=True)
+            if log_func: log_func(f"ERROR: {error_msg}")
     elif len(final_concepts) < 2:
-        logger.info("Skipping relation extraction (less than 2 concepts found).")
+        msg = "Skipping relation extraction (less than 2 concepts found)."
+        if log_func: log_func(msg)
+        logger.info(msg) # Keep backend log
 
     # --- Step 4: Return combined results ---
     # Sort concepts again before returning for consistent final output
     final_concepts.sort(key=lambda x: x['start_char'])
+    if log_func: log_func("Processing complete. Returning results.")
     return {
         'concepts': final_concepts,
         'relations': extracted_relations
     }
 
-# --- Example Usage & Visualization ---
-if __name__ == "__main__":
-    # Define which phrases to visualize (modify this list as needed)
-    # Select ONLY ONE phrase at a time for visualization unless you handle threading/manual stopping
-    phrases_to_visualize = [
-         # "Patient presents with metastatic lung cancer to the liver.",
-         # "Treatment included cisplatin and radiation.",
-         # "History of Asthma, no current exacerbation.",
-         # "Negative for fever and chills.",
-         "Severe pain in abdomen." # Example: Visualize this one
-    ]
-
-    test_phrases = [ # Keep the full list for processing
-        "Patient presents with metastatic lung cancer to the liver.",
-        "Melanoma stage III diagnosed.",
-        "Treatment included cisplatin and radiation.",
-        "History of Asthma, no current exacerbation.",
-        "Negative for fever and chills.",
-        "Severe pain in abdomen."
-    ]
-
-    if not nlp:
-         print("Cannot run examples because ScispaCy model failed to load.", file=sys.stderr)
-    else:
-        # Keep logging at INFO level by default
-        # logging.getLogger().setLevel(logging.DEBUG) # Uncomment for full DEBUG logs
-
-        for p in test_phrases:
-
-            # --- Visualization Block START --- <<< TEMPORARY for DEBUGGING >>>
-            # This block uses the *phrase string* 'p'. The main processing uses 'doc'.
-            # Ensure this works or adjust to pass the 'doc' object if needed.
-            if p in phrases_to_visualize:
-                print("\n" + "="*20 + " VISUALIZATION " + "="*20)
-                print(f"Attempting to serve displacy visualization for:\n'{p}'")
-                print("Access http://localhost:5000 (or host IP) in your browser.")
-                print("Stop the script with Ctrl+C in the terminal when done viewing.")
-                print("="*55 + "\n")
-                try:
-                    # It's better to use the same 'doc' object that relation extraction will use
-                    # We process it here *before* calling process_phrase for visualization
-                    doc_for_viz = nlp(p)
-                    displacy.serve(doc_for_viz, style="dep", port=5000, host="0.0.0.0")
-                    # displaCy serve blocks here until stopped
-                except Exception as e:
-                    logger.error(f"Failed to serve displacy: {e}", exc_info=True)
-                print("\n" + "="*20 + " Resuming Processing... " + "="*20)
-                # Since displacy blocks, only one phrase will be visualized per run unless stopped manually.
-                # Comment out the displacy.serve line or the whole block when done debugging.
-            # --- Visualization Block END ---
-
-            # --- Regular Processing ---
-            results = process_phrase(p) # Call the main processing function
-            concepts = results.get('concepts', [])
-            relations = results.get('relations', [])
-
-            # --- Print Results ---
-            print("-" * 60)
-            print(f"Results for: '{p}'")
-            print("-" * 60)
-            if concepts:
-                print("\n[Concepts Identified]")
-                # Concepts are already sorted by start_char inside process_phrase before return
-                for concept in concepts:
-                    source_tag = f"({concept.get('source', 'ner')})"
-                    print(f"  - Span:      '{concept['text_span']}' ({concept['start_char']}:{concept['end_char']}) {source_tag}")
-                    print(f"    Matched:   '{concept['matched_term']}'")
-                    print(f"    CUI:       {concept['cui']} (Code: {concept['code']})")
-                    print(f"    Sem Types: {', '.join(concept['sem_types']) if concept['sem_types'] else '[None Found]'}")
-                    print(f"    Score:     {concept.get('score', 'N/A'):.2f}")
-            else: print("\n[Concepts Identified]\n  No concepts identified.")
-            if relations:
-                 print("\n[Relations Extracted]")
-                 for rel in relations:
-                    subj_text = next((c['text_span'] for c in concepts if c['cui'] == rel.get('subject_cui')), rel.get('subj_text', '???'))
-                    obj_text = next((c['text_span'] for c in concepts if c['cui'] == rel.get('object_cui')), rel.get('obj_text', '???'))
-                    print(f"  - ({subj_text}) --[{rel.get('relation', '?')} ({rel.get('source', '?')})]--> ({obj_text})")
-            else: print("\n[Relations Extracted]\n  No relations extracted.")
-            print("-" * 60 + "\n")
-
+# NOTE: The if __name__ == "__main__": block has been removed.
+#       Testing and execution should now happen via the API.
 # --- END OF FILE scripts/process_phrase.py ---
