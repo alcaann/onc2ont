@@ -1,30 +1,21 @@
 # docker-compose.yaml
-version: '3.8'
 
 services:
   db:
     image: postgres:15 # Use a specific PostgreSQL version
     container_name: umls_postgres_db
     volumes:
-      # --- THIS LINE ENABLES PERSISTENCE ---
-      # Mount a named volume 'postgres_data' to persist database data
       - postgres_data:/var/lib/postgresql/data
-      # --------------------------------------
-      # Optional: Mount init scripts if needed (e.g., to enable extensions like pg_trgm)
-      # Create db_init/01-enable-pgtrgm.sql with "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
-      # - ./db_init:/docker-entrypoint-initdb.d
+      # - ./db_init:/docker-entrypoint-initdb.d # Optional init scripts
     environment:
-      # These MUST match the values the Python app expects
-      POSTGRES_DB: umls_db
-      POSTGRES_USER: umls_user
-      # --- IMPORTANT: Use a secure method (env vars, secrets) for production ---
-      POSTGRES_PASSWORD: your_very_secure_password_here
+      POSTGRES_DB: umls_db # Match app env
+      POSTGRES_USER: umls_user # Match app env
+      POSTGRES_PASSWORD: your_very_secure_password_here # Match app env
     ports:
-      # Map internal port 5432 to host port 5433 (avoids conflicts)
+      # Map internal DB port 5432 to host port 5433 (for external tools if needed)
       - "5433:5432"
     networks:
       - umls_net
-    # Healthcheck ensures the DB is ready before the app starts depending on it
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -q"]
       interval: 10s
@@ -33,43 +24,36 @@ services:
 
   app:
     build:
-      context: . # Build from the current directory
-      dockerfile: Dockerfile # Using the Dockerfile we defined
+      context: .
+      dockerfile: Dockerfile
     container_name: umls_processor_app
     environment:
-      #LOG_LEVEL: DEBUG # Uncomment to set the logging level for the Python app
-      # Pass database connection details to the Python app container
-      # Uses values defined in the 'db' service environment
+      # LOG_LEVEL: DEBUG
       POSTGRES_DB: umls_db
       POSTGRES_USER: umls_user
-      # --- IMPORTANT: Use the SAME password as above! ---
       POSTGRES_PASSWORD: your_very_secure_password_here
-      # Renamed POSTGRES_HOST to DB_HOST to match db_utils.py expectation (using getenv('DB_HOST', 'db'))
-      DB_HOST: db # Service name resolution via Docker Compose network
-      # Renamed POSTGRES_PORT to DB_PORT to match db_utils.py expectation (using getenv('DB_PORT', '5432'))
-      DB_PORT: 5432 # Internal PostgreSQL port
-      # Add any other environment variables your app might need
-      # PYTHONUNBUFFERED: 1 # Already set in Dockerfile
+      DB_HOST: db
+      DB_PORT: 5432 # App connects to DB internally on 5432
+      # PYTHONUNBUFFERED: 1 # Set in Dockerfile
     volumes:
-      # Mount the local UMLS source data as read-only into the container
-      # Assumes your local machine has the data at ./data/source/umls/META
       - ./data/source/umls/META:/app/data/source/umls/META:ro
-      # Optional: Mount local code for development (changes reflect without rebuild)
-      # Comment out for "production" style runs.
-      - .:/app:rw
+      - .:/app:rw # Mount local code for development
     networks:
       - umls_net
     depends_on:
       db:
-        condition: service_healthy # Waits for db healthcheck to pass
-    stdin_open: true # Keep stdin open for interactive shells (e.g., CMD ["bash"])
-    tty: true        # Allocate a pseudo-TTY for interactive shells
+        condition: service_healthy
+    # --- ADD THIS SECTION ---
+    ports:
+      # Map host port 5000 to container port 5000 (for displacy.serve)
+      - "5000:5000"
+    # ------------------------
+    stdin_open: true
+    tty: true
 
 networks:
   umls_net:
-    driver: bridge # Use the default bridge network driver
+    driver: bridge
 
-# --- THIS DECLARES THE NAMED VOLUME ---
 volumes:
-  postgres_data: # Define the named volume used by the 'db' service for data persistence
-# --------------------------------------
+  postgres_data:

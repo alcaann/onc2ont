@@ -1,0 +1,7 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+you are helping an computer science student to do his thesis about designing and implementing an ai model that receives short phrases about the state/procedure of an oncology patient, and outputs a list of snomed/ontology terms and the relations between the terms. (actual status of the project is described in context.txt)

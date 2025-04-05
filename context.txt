@@ -1,0 +1,92 @@
+--- START OF FILE context.txt ---
+
+**Project Goal:** Develop an AI pipeline for a thesis that takes short oncology patient phrases as input and outputs a list of **NCI Thesaurus (NCIt)** concepts and the detailed relationships between them, ultimately for visualization as an interactive knowledge graph in a web application. (Considered Radiation Oncology Ontology (ROO), but it's likely not directly in the loaded UMLS subset; integration is deferred unless strictly required).
+
+**Environment & Data Setup:**
+
+1.  **Environment:** Dockerized using Docker Compose (`docker-compose.yml`).
+2.  **Services:**
+    *   `db`: PostgreSQL 15 (`umls_postgres_db`), using **persistent data storage** via a named Docker volume (`postgres_data`). Healthcheck enabled.
+    *   `app`: Python 3.10 (`umls_processor_app`) image built via `Dockerfile`. Runs as non-root user `appuser`.
+3.  **Data Handling & Status:**
+    *   **UMLS Subset:** Successfully loaded into the persistent PostgreSQL `db` service. Contains `MRCONSO` (terms/codes from many sources including **NCIt (SAB='NCI')** and SNOMED CT) and `MRSTY` (semantic types linked via CUI). Data confirmed to persist across container restarts.
+    *   **Database Connection:** `psycopg2-binary` used for DB connection from the `app` container. Connection details passed via environment variables.
+    *   **Source Data Mount:** Host UMLS RRF source (`./data/source/umls/META`) mounted read-only into `app` at `/app/data/source/umls/META`.
+
+**Core Pipeline Strategy (Current - Strategy 2):**
+
+*   **NER:** Use **ScispaCy NER** (model `en_ner_bc5cdr_md`, installed via `requirements.txt`) to identify entity text spans and labels (e.g., "Melanoma", "DISEASE").
+*   **Term-to-Concept (TTC):** Use **Custom Database Lookup** targeting **NCI Thesaurus (SAB='NCI')**.
+    *   For each entity span from ScispaCy (`ent.text`), query `mrconso` using partial, case-insensitive matching (`find_concept_by_term_and_source` with `exact_match=False`, `source_sab='NCI'`).
+    *   Retrieve candidate concepts (CUI, NCIt term, NCIt Code).
+    *   Fetch semantic types from `mrsty` using the CUI (`get_semantic_types_for_cui`).
+    *   Filter candidates based on compatibility between the ScispaCy NER label and the retrieved UMLS semantic types (using `LABEL_TO_SEMANTIC_TYPES` map in `process_phrase.py`).
+    *   Select the best match (currently picks the first filtered match).
+
+**Key Scripts & File Descriptions:**
+
+*   **`docker-compose.yml`:** Defines the `db` and `app` services, network (`umls_net`), persistent volume (`postgres_data`), environment variables (DB connection details, passwords), and mounts source code/data. Includes `depends_on` with `service_healthy` condition.
+*   **`Dockerfile`:** Builds the `app` image: installs system dependencies (`postgresql-client`), Python requirements (`requirements.txt`), copies application code, sets up a non-root user (`appuser`), installs ScispaCy model (`en_ner_bc5cdr_md`), sets `entrypoint.sh`.
+*   **`requirements.txt`:** Lists Python dependencies, correctly pinned for compatibility: `psycopg2-binary`, `spacy==3.6.1`, `scispacy==0.5.3`, the ScispaCy model URL (`en_ner_bc5cdr_md`), and `rapidfuzz`. Simplified to let pip resolve transitive dependencies.
+*   **`entrypoint.sh`:** Container startup script. Waits for DB (`pg_isready`), checks if DB is populated (querying `mrconso` via `psql`) to avoid rerunning loader, checks for UMLS source files (`MRCONSO.RRF`, `MRSTY.RRF`), conditionally runs `load_umls_to_pgsql.py` if DB empty and source files exist, then executes the main container command (`CMD`).
+*   **`db_setup/load_umls_to_pgsql.py`:** Python script (run once initially or if DB empty by entrypoint) to connect to DB, create tables (`mrconso`, `mrsty`, etc.), and load data from UMLS RRF files using `COPY`.
+*   **`scripts/db_utils.py`:** Contains Python functions for database interaction:
+    *   `get_db_connection()`: Establishes connection using env vars.
+    *   `find_concept_by_term_and_source()`: Queries `mrconso` for terms, filtering by SAB, supporting exact/partial matching. Returns list of tuples `(cui, term, code)`.
+    *   `get_semantic_types_for_cui()`: Queries `mrsty` for semantic types for a given CUI. Returns list of tuples `(tui, type_name)`.
+*   **`scripts/process_phrase.py`:** **Core pipeline script.** Implements Strategy 2 (ScispaCy NER `en_ner_bc5cdr_md` + Custom DB TTC targeting `NCI`). Takes phrase, runs ScispaCy NER (`nlp(phrase)`), iterates through `doc.ents`. Calls helper `get_filtered_db_matches(ent.text, ent.label)` which performs DB lookup (`find_concept...`) and semantic filtering (`get_semantic_types...`). Selects best match (currently first), handles deduplication (`processed_cuis_in_phrase`), and returns list of final concepts (dictionaries with `text_span`, `matched_term`, `cui`, `code` (NCIt), `sem_types`). Includes example usage in `if __name__ == "__main__":`.
+*   **`scripts/align_annotations.py`:** (Likely Inactive in Core Pipeline) Probably used for aligning predicted annotations with gold-standard annotations for evaluation. **Needed only if quantitative evaluation against annotated data is performed.**
+*   **`scripts/parse_raw.py`:** (Likely Inactive in Core Pipeline) Probably used for parsing/extracting input phrases from a more raw data format (e.g., XML, raw notes). **Needed only if data preprocessing from such formats is required.**
+*   **`scripts/process_text.py`:** (Likely Inactive in Core Pipeline) Probably contained text cleaning routines or the previous NER/TTC implementation. **Superseded by `process_phrase.py` for the core extraction task.**
+
+**Folder Structure (Current):**
+
+```
+.
+├── data/
+│   └── source/
+│       └── umls/
+│           └── META/      # UMLS RRF files (mounted r/o to app)
+├── db_setup/
+│   └── load_umls_to_pgsql.py # UMLS subset loader script
+├── scripts/
+│   ├── db_utils.py       # DB query functions
+│   ├── process_phrase.py # Core processing logic (ScispaCy NER + Custom NCI TTC)
+│   ├── align_annotations.py # (Inactive - Evaluation)
+│   ├── parse_raw.py         # (Inactive - Preprocessing)
+│   └── process_text.py      # (Inactive - Old/Cleaning)
+├── templates/             # (Placeholder for Web App HTML)
+├── static/                # (Placeholder for Web App CSS/JS)
+├── .dockerignore
+├── .gitignore
+├── docker-compose.yml
+├── Dockerfile
+├── entrypoint.sh
+└── requirements.txt
+```
+
+**Current Status & Achievements:**
+
+*   Docker environment stable with persistent database storage.
+*   UMLS subset (including NCIt) successfully loaded and verified.
+*   Entrypoint correctly handles DB readiness and prevents unnecessary data reloads.
+*   Dependency conflicts resolved; required packages (`spacy`, `scispacy`, model) installed.
+*   **Strategy 2 (ScispaCy NER + Custom DB TTC targeting NCI) is implemented and functional.**
+    *   ScispaCy NER model (`en_ner_bc5cdr_md`) successfully integrated.
+    *   Pipeline identifies entities using ScispaCy.
+    *   Pipeline queries the database for matching NCI concepts using partial matching.
+    *   Pipeline retrieves semantic types from the database.
+    *   Basic semantic type filtering (based on NER label) is implemented.
+    *   Script outputs identified NCI concepts (CUI, NCIt Code, Matched Term, Sem Types).
+
+**Next Milestones / Immediate Focus:**
+
+1.  **Refine TTC / Filtering / Ranking (within `process_phrase.py`):**
+    *   Analyze the quality of the current partial matching + semantic filtering. Does it find correct concepts for complex oncology terms? Does it still include too much noise (e.g., very short/generic `matched_term` from the DB)?
+    *   Improve the selection logic in `get_filtered_db_matches` if multiple candidates pass the filter (e.g., rank by string similarity using `rapidfuzz` between `entity_text` and `matched_term`, prefer shorter/exact matches over broader partial matches).
+    *   Refine the `LABEL_TO_SEMANTIC_TYPES` mapping for better filtering accuracy based on observed results.
+    *   Consider adding basic negation handling (e.g., using `negspacy` - would require adding to requirements/Dockerfile).
+2.  **Implement Relation Extraction:** Design and implement logic to identify relationships between the extracted NCI concepts.
+3.  **Web Application Backend & Frontend:** Develop API and visualization.
+
+--- END OF FILE context.txt ---

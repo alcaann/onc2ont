@@ -44,7 +44,7 @@ USER appuser
 RUN chmod +x /app/entrypoint.sh
 
 # Download the spaCy model during the build
-RUN python -m spacy download en_core_web_sm
+#RUN python -m spacy download en_core_web_sm
 
 # Set the entrypoint script to run when the container starts
 ENTRYPOINT ["/app/entrypoint.sh"]
