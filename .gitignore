@@ -20,6 +20,7 @@ database/
 .vscode/
 .idea/
 *.DS_Store
+.cursor/
 
 # Large Source Data (Highly Recommended - assumes data is downloaded separately)
 # If you MUST keep data/source in git, remove this line, but beware of repo size.

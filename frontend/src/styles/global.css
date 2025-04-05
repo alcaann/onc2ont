@@ -1,0 +1,154 @@
+/* frontend/src/styles/global.css */
+
+/* Basic Reset / Box Sizing */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  height: 100%; /* Ensure html takes full height */
+}
+
+body {
+  font-family: system-ui, sans-serif;
+  line-height: 1.5;
+  background-color: #f0f2f5;
+  color: #1a1a1a;
+  height: 100%; /* Make body take full height */
+  display: flex; /* Use flex to make main-grid fill height */
+  flex-direction: column;
+}
+
+h1, h2 {
+  margin-bottom: 0.75rem;
+  color: #333;
+  font-weight: 600;
+}
+h1 { font-size: 1.8em; }
+h2 { font-size: 1.2em; }
+
+/* Main Layout Grid */
+.main-grid {
+  display: grid;
+  /* Define rows: Top auto (header), Middle flexible (input/graph), Bottom flexible (logs) */
+  /* Use fr units to distribute remaining space */
+  grid-template-rows: auto minmax(0, 2fr) minmax(0, 1fr);
+  /* Define cols: Equal width for input/graph */
+  grid-template-columns: 1fr 1fr;
+  /* Define areas */
+  grid-template-areas:
+    "header   header"
+    "input    graph"
+    "logs     logs"; /* Logs span both columns */
+  gap: 1rem;
+  padding: 1rem;
+  flex-grow: 1; /* Allow grid to grow to fill body */
+  height: 100%; /* Ensure grid takes full height */
+  max-height: 100vh; /* Prevent overflow at body level */
+  overflow: hidden; /* Prevent body scroll */
+}
+
+/* Assign areas */
+.header-area { grid-area: header; }
+.input-area { grid-area: input; display: flex; flex-direction: column; min-height: 0; /* Allow shrinking */ }
+.graph-area { grid-area: graph; display: flex; flex-direction: column; min-height: 0; /* Allow shrinking */}
+.logs-area { grid-area: logs; display: flex; flex-direction: column; min-height: 0; /* Crucial for scrolling child */}
+
+/* Style for individual sections/components */
+.input-section,
+.log-section,
+.graph-section {
+  background-color: #ffffff;
+  padding: 1rem;
+  border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+  display: flex; /* Use flex column for content */
+  flex-direction: column;
+  flex-grow: 1; /* Allow sections to fill their grid area */
+  min-height: 0; /* Needed for children scrolling */
+  overflow: hidden; /* Prevent section itself from scrolling */
+}
+
+/* Input Form Specific */
+.input-section textarea {
+  width: 100%;
+  /* Let's use a flexible height instead of fixed min-height */
+  min-height: 80px;
+  flex-grow: 1; /* Allow textarea to take up space */
+  margin-bottom: 0.5rem;
+  padding: 0.5rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-family: inherit;
+  resize: vertical;
+}
+
+.input-section button {
+  padding: 0.6rem 1rem;
+  background-color: #007bff;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+  align-self: flex-start; /* Align button left */
+  flex-shrink: 0; /* Prevent button from shrinking */
+}
+
+.input-section button:hover { background-color: #0056b3; }
+.input-section button:disabled { background-color: #cccccc; cursor: not-allowed; }
+
+/* Log Console Specific */
+/* .log-section needs min-height: 0 and flex-grow: 1 (set above) */
+.log-console {
+  flex-grow: 1; /* Make console fill available space in its section */
+  background-color: #282c34;
+  color: #abb2bf;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: 0.9em;
+  padding: 0.8rem;
+  overflow-y: auto; /* <<< ENSURE THIS IS PRESENT for scrolling */
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  /* Remove fixed height, let flexbox handle it */
+}
+
+/* Graph Visualizer Specific */
+/* .graph-section needs min-height: 0 and flex-grow: 1 (set above) */
+#cy-container {
+  width: 100%;
+  flex-grow: 1; /* Allow container to fill the section */
+  min-height: 200px; /* Minimum height for visibility */
+  border: 1px solid #ddd;
+  background-color: #fafafa;
+  border-radius: 4px;
+}
+
+/* Status Indicator */
+.status-indicator {
+  margin-top: 5px;
+  font-size: 0.85em;
+}
+.status-connected { color: green; }
+.status-disconnected { color: red; }
+.status-processing { color: orange; }
+.status-error { color: darkred; font-weight: bold;} /* Added error style */
+
+/* Cytoscape Tooltip Style (example) */
+#cy-tooltip {
+  position: absolute;
+  padding: 5px;
+  background: rgba(0, 0, 0, 0.7);
+  color: white;
+  font-size: 12px;
+  border-radius: 3px;
+  pointer-events: none; /* Don't block mouse events */
+  display: none; /* Hidden by default */
+  z-index: 1000; /* Ensure it's on top */
+  white-space: pre-wrap; /* Allow wrapping inside tooltip */
+}

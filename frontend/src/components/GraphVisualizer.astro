@@ -1,0 +1,140 @@
+---
+// frontend/src/components/GraphVisualizer.astro (REVISED)
+---
+<div class="graph-section">
+    <h2>Concept Graph</h2>
+    <div id="cy-container">
+        <!-- Cytoscape graph will be rendered here -->
+    </div>
+</div>
+
+<script>
+    import cytoscape from 'cytoscape';
+    import { wsManager } from '../lib/websocket';
+
+    const cyContainer = document.getElementById('cy-container');
+    let cyInstance = null; // To hold the Cytoscape instance
+
+    // Basic Cytoscape styling (Keep as is)
+    const cyStyle = [
+        { selector: 'node', style: { 'background-color': '#007bff', 'label': 'data(label)', 'color': '#333', 'font-size': '10px', 'text-valign': 'center', 'text-halign': 'center', 'width': 'label', 'height': 'label', 'padding': '8px', 'shape': 'round-rectangle', 'border-width': 1, 'border-color': '#0056b3' } },
+        { selector: 'node[type="DISEASE"]', style: { 'background-color': '#dc3545', 'border-color': '#b02a37' } },
+        { selector: 'node[type="CHEMICAL"]', style: { 'background-color': '#ffc107', 'border-color': '#cc9a06' } },
+        { selector: 'node[type="OTHER"]', style: { 'background-color': '#6c757d', 'border-color': '#5a6268' } }, // Style for 'OTHER'
+        { selector: 'edge', style: { 'width': 2, 'line-color': '#6c757d', 'target-arrow-color': '#6c757d', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'label': 'data(label)', 'font-size': '9px', 'color': '#444', 'text-rotation': 'autorotate', 'text-background-opacity': 1, 'text-background-color': '#ffffff', 'text-background-padding': '2px', 'text-background-shape': 'round-rectangle' } }
+    ]; // Added OTHER style, ensure your full styles are here
+
+    // Layout options - START WITH A SIMPLER ONE
+    const cyLayoutOptions = {
+        name: 'breadthfirst', // Often good for directed graphs, simpler than cose
+        fit: true,       // Fit the viewport to the graph
+        padding: 30,     // Padding around layout
+        directed: true,  // Treat edges as directed
+        spacingFactor: 1.75, // Increase spacing
+        // grid: false // Use grid coordinates (alternative)
+    };
+    // const coseLayoutOptions = { name: 'cose', /* ... keep your cose options here for later if needed ... */ };
+
+
+    function runLayout(instance) {
+        if (!instance) return;
+        console.log("[GraphVisualizer.astro] Running layout...");
+        const layout = instance.layout(cyLayoutOptions); // Use the simpler layout first
+        layout.run();
+        console.log("[GraphVisualizer.astro] Layout finished.");
+    }
+
+    // Function to initialize or update the Cytoscape graph
+    function initializeOrUpdateGraph(concepts = [], relations = []) {
+         console.log('[GraphVisualizer.astro] initializeOrUpdateGraph called.');
+         console.log('[GraphVisualizer.astro] Concepts received:', concepts);
+         console.log('[GraphVisualizer.astro] Relations received:', relations);
+
+        if (!cyContainer) {
+            console.error("[GraphVisualizer.astro] Cytoscape container not found.");
+            return;
+        }
+        // Ensure container has dimensions before initializing
+        if (cyContainer.clientHeight === 0 || cyContainer.clientWidth === 0) {
+             console.warn("[GraphVisualizer.astro] Cytoscape container has zero dimensions. Delaying graph update slightly.");
+             // Delay slightly to allow rendering/CSS to apply
+             setTimeout(() => initializeOrUpdateGraph(concepts, relations), 100);
+             return;
+        }
+
+        try {
+            const nodes = concepts.map(concept => ({
+                data: {
+                    id: concept.cui,
+                    label: concept.text_span || concept.matched_term,
+                    full_term: concept.matched_term,
+                    cui: concept.cui,
+                    code: concept.code,
+                    sem_types: concept.sem_types?.join(', ') || 'N/A',
+                    // Ensure 'OTHER' is the default
+                    type: concept.sem_types?.some(st => ["Neoplastic Process", "Disease or Syndrome"].includes(st)) ? "DISEASE" :
+                          concept.sem_types?.some(st => ["Pharmacologic Substance", "Clinical Drug"].includes(st)) ? "CHEMICAL" :
+                          "OTHER"
+                }
+            }));
+            console.log('[GraphVisualizer.astro] Mapped Nodes:', nodes);
+
+            const edges = relations.map((rel, index) => ({
+                data: {
+                    id: `e${index}_${rel.subject_cui}_${rel.object_cui}`,
+                    source: rel.subject_cui,
+                    target: rel.object_cui,
+                    label: rel.relation || 'related'
+                }
+            }));
+            console.log('[GraphVisualizer.astro] Mapped Edges:', edges);
+
+            const elements = [...nodes, ...edges];
+
+            if (!cyInstance) {
+                console.log("[GraphVisualizer.astro] Initializing new Cytoscape instance.");
+                cyInstance = cytoscape({
+                    container: cyContainer,
+                    elements: elements,
+                    style: cyStyle,
+                    // Don't run layout immediately, do it after mount/render
+                });
+
+                 // Add Tooltip Interaction (Keep as is)
+                 cyInstance.on('mouseover', 'node', function(event){ /* ... tooltip logic ... */ const node = event.target; const nodeData = node.data(); let tooltip = document.getElementById('cy-tooltip'); if (!tooltip) { tooltip = document.createElement('div'); tooltip.id = 'cy-tooltip'; /* styles... */ document.body.appendChild(tooltip); } tooltip.style.left = event.originalEvent.clientX + 10 + 'px'; tooltip.style.top = event.originalEvent.clientY + 10 + 'px'; tooltip.innerHTML = `<strong>${nodeData.label}</strong><br>CUI: ${nodeData.cui}<br>Term: ${nodeData.full_term}<br>Types: ${nodeData.sem_types}`; tooltip.style.display = 'block';});
+                 cyInstance.on('mouseout', 'node', function(event){ /* ... hide tooltip ... */ let tooltip = document.getElementById('cy-tooltip'); if (tooltip) tooltip.style.display = 'none'; });
+
+                 // Run layout after initial creation
+                 runLayout(cyInstance);
+
+            } else {
+                console.log("[GraphVisualizer.astro] Updating existing Cytoscape instance.");
+                cyInstance.elements().remove();
+                cyInstance.add(elements);
+                // Run layout after adding elements
+                runLayout(cyInstance);
+            }
+             console.log("[GraphVisualizer.astro] Graph update process finished successfully.");
+
+        } catch (error) {
+            console.error("[GraphVisualizer.astro] Error during graph update:", error);
+            if (cyContainer) {
+                cyContainer.textContent = `Error updating graph: ${error.message}. Check console.`;
+                cyContainer.style.color = 'red';
+            }
+        }
+    }
+
+    // Subscribe to results from WebSocket manager
+    const unsubscribeResult = wsManager.onResult((data) => {
+        console.log('[GraphVisualizer.astro] onResult callback triggered. Data:', data);
+        initializeOrUpdateGraph(data.concepts, data.relations);
+    });
+
+    // Initialize with an empty graph on load, maybe after a short delay
+    console.log('[GraphVisualizer.astro] Initializing empty graph on component load.');
+    // Use setTimeout to ensure the container is likely rendered by the browser
+    setTimeout(() => initializeOrUpdateGraph(), 0);
+
+
+</script>

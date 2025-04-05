@@ -1,0 +1,51 @@
+---
+// frontend/src/components/InputForm.astro (REVISED)
+---
+<div class="input-section">
+  <h2>Input Phrase</h2>
+  <textarea id="phrase-input" placeholder="Enter oncology patient phrase... e.g., Melanoma stage III diagnosed."></textarea>
+  <button id="submit-button">Process Phrase</button>
+</div>
+
+<script>
+  import { wsManager } from '../lib/websocket';
+
+  const textarea = document.getElementById('phrase-input') as HTMLTextAreaElement;
+  const button = document.getElementById('submit-button') as HTMLButtonElement;
+
+  let isProcessing = false; // Local state
+
+  function handleSubmit() {
+    const phrase = textarea.value.trim();
+    if (phrase && !isProcessing) {
+       // --- DEBUG ---
+       console.log('[InputForm.astro] Sending phrase:', phrase);
+       // --- END DEBUG ---
+      wsManager.sendMessage('process_phrase', phrase);
+    } else if (!phrase) {
+       alert("Please enter a phrase.");
+    }
+  }
+
+  button.addEventListener('click', handleSubmit);
+  textarea.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      handleSubmit();
+    }
+  });
+
+  // Subscribe to status changes
+  const unsubscribeStatus = wsManager.onStatusChange((status) => {
+    // --- DEBUG ---
+    console.log('[InputForm.astro] onStatusChange callback triggered. Status:', status);
+    // --- END DEBUG ---
+    isProcessing = (status === 'processing');
+    button.disabled = isProcessing;
+    button.textContent = isProcessing ? 'Processing...' : 'Process Phrase';
+     // --- DEBUG ---
+     console.log('[InputForm.astro] Button disabled state:', button.disabled);
+     // --- END DEBUG ---
+  });
+
+</script>

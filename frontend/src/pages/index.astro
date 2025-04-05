@@ -1,0 +1,29 @@
+---
+// frontend/src/pages/index.astro (REVISED)
+import MainLayout from '../layouts/MainLayout.astro';
+import InputForm from '../components/InputForm.astro';
+import LogConsole from '../components/LogConsole.astro';
+import GraphVisualizer from '../components/GraphVisualizer.astro';
+---
+<MainLayout title="Oncology Phrase Processor">
+
+  <InputForm slot="input" client:load />      {/* Place in "input" slot */}
+
+  <GraphVisualizer slot="graph" client:load />  {/* Place in "graph" slot */}
+
+  <LogConsole slot="logs" client:load />       {/* Place in "logs" slot */}
+
+</MainLayout>
+
+<style is:global>
+ /* Ensure slot wrappers fill their grid areas */
+ .input-area, .graph-area, .logs-area {
+    display: flex; /* Use flex on the wrapper */
+    flex-direction: column; /* Stack content vertically */
+    height: 100%;
+    min-height: 0; /* Allow shrinking for scroll */
+ }
+
+ /* Optional: Add a gap if needed, though components have padding */
+ /* .input-area > *, .graph-area > *, .logs-area > * { margin-bottom: 1rem; } */
+</style>

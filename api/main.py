@@ -5,8 +5,11 @@ import json
 import logging
 import os
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse # Optional: For serving a basic HTML page later
+from fastapi.responses import HTMLResponse
 from starlette.websockets import WebSocketState
+from typing import Optional, List, Dict, Any # Added for clarity
+from collections.abc import Callable # Added for clarity
+
 
 # Adjust the import path based on your project structure
 # If main.py is in api/ and process_phrase.py is in scripts/, this should work
@@ -30,15 +33,11 @@ logger = logging.getLogger(__name__) # Logger specific to this API file
 
 app = FastAPI()
 
-# --- WebSocket Message Format ---
+# WebSocket Message Format Documentation (for clarity)
 # Client -> Server: {'type': 'process_phrase', 'payload': 'text phrase'}
 # Server -> Client: {'type': 'log', 'payload': 'log message'}
 # Server -> Client: {'type': 'result', 'payload': {'concepts': [...], 'relations': [...]}}
 # Server -> Client: {'type': 'error', 'payload': 'error message'}
-
-# In-memory storage for active connections if needed (e.g., for broadcasting)
-# For this use case (one client per processing task), it's not strictly necessary
-# active_connections: list[WebSocket] = []
 
 
 @app.websocket("/ws")
@@ -46,10 +45,10 @@ async def websocket_endpoint(websocket: WebSocket):
     """Handles WebSocket connections for phrase processing."""
     await websocket.accept()
     logger.info(f"WebSocket connection accepted from: {websocket.client.host}:{websocket.client.port}")
-    # active_connections.append(websocket) # Add if broadcasting needed
 
-    # Use a queue for thread-safe communication between the processing thread and the WebSocket task
-    log_queue: asyncio.Queue[Optional[str]] = asyncio.Queue() # Queue holds log messages or None signal
+    log_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+    log_sender_task = None
+    main_event_loop = asyncio.get_running_loop() # Capture the main event loop
 
     async def send_logs():
         """Reads logs from the queue and sends them over WebSocket."""
@@ -66,20 +65,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     logger.debug(f"Sent log via WS: {message}")
                 else:
                     logger.warning("WebSocket disconnected while trying to send log.")
-                    # Drain the queue if client disconnected? Or just stop?
-                    log_queue.task_done() # Mark item as processed even if not sent
+                    log_queue.task_done()
                     break # Exit if websocket closed
                 log_queue.task_done()
             except Exception as e:
                  logger.error(f"Error in send_logs task: {e}", exc_info=True)
-                 # Ensure task_done is called even on error if item was retrieved
-                 try:
-                     log_queue.task_done()
-                 except ValueError: # If task_done() called more times than items put
-                     pass
+                 try: log_queue.task_done()
+                 except ValueError: pass
                  break # Stop the task on error
-
-    log_sender_task = None # Initialize task variable
 
     try:
         while True:
@@ -96,7 +89,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     phrase = payload
                     logger.info(f"Processing request for phrase: '{phrase}'")
 
-                    # Ensure previous log sender task (if any) is stopped before starting new one
+                    # Clean up previous task if still running
                     if log_sender_task and not log_sender_task.done():
                          logger.warning("New request received before previous log sender finished. Attempting cleanup.")
                          try:
@@ -107,17 +100,13 @@ async def websocket_endpoint(websocket: WebSocket):
                          except Exception as e:
                               logger.error(f"Error cleaning up previous log sender: {e}")
 
-
                     # Clear the queue for the new request
                     while not log_queue.empty():
                          try:
                               log_queue.get_nowait()
                               log_queue.task_done()
-                         except asyncio.QueueEmpty:
-                              break
-                         except ValueError:
-                              pass
-
+                         except asyncio.QueueEmpty: break
+                         except ValueError: pass
 
                     # Start the log sending task for this request
                     log_sender_task = asyncio.create_task(send_logs())
@@ -125,11 +114,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Define the synchronous callback function to put logs onto the async queue
                     def log_callback_sync(message: str):
                         try:
-                            # Use call_soon_threadsafe because process_phrase runs in a separate thread
-                            asyncio.get_running_loop().call_soon_threadsafe(log_queue.put_nowait, message)
+                            # Use the captured main_event_loop for thread safety
+                            main_event_loop.call_soon_threadsafe(log_queue.put_nowait, message)
                         except Exception as e:
                             # Log error if putting to queue fails (e.g., queue full, loop stopped)
-                            logger.error(f"Error putting log message to queue from thread: {e}")
+                            logger.error(f"Error submitting log message to queue from thread: {e}")
 
 
                     # Run the potentially long-running, synchronous process_phrase in a separate thread
@@ -137,7 +126,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         results = await asyncio.to_thread(
                             process_phrase,
                             phrase,
-                            log_callback=log_callback_sync
+                            log_func=log_callback_sync # Use correct keyword arg name 'log_func'
                         )
                         logger.info(f"Processing completed for phrase: '{phrase}'. Found {len(results.get('concepts',[]))} concepts, {len(results.get('relations',[]))} relations.")
 
@@ -161,7 +150,6 @@ async def websocket_endpoint(websocket: WebSocket):
                             logger.debug("Signalling log sender task to stop.")
                             await log_queue.put(None) # Send sentinel
                             try:
-                                # Wait for the queue to be fully processed and the task to finish
                                 await asyncio.wait_for(log_sender_task, timeout=5.0)
                                 logger.debug("Log sender task finished.")
                             except asyncio.TimeoutError:
@@ -210,7 +198,6 @@ async def websocket_endpoint(websocket: WebSocket):
              await websocket.close(code=1011) # Internal Error code
 
     finally:
-        # active_connections.remove(websocket) # Remove if broadcasting needed
         logger.info(f"WebSocket connection closed for: {websocket.client.host}:{websocket.client.port}")
 
 

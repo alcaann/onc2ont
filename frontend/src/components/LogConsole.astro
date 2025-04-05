@@ -1,0 +1,72 @@
+---
+// frontend/src/components/LogConsole.astro
+---
+<div class="log-section">
+    <h2>Processing Logs</h2>
+    <pre id="log-output" class="log-console">Connecting...</pre>
+  </div>
+  
+  <script>
+    import { wsManager } from '../lib/websocket';
+  
+    const logOutput = document.getElementById('log-output');
+    let isScrolledToBottom = true; // Auto-scroll state
+  
+    if (logOutput) {
+      // Check scroll position before updating content
+      logOutput.addEventListener('scroll', () => {
+        // Check if scrolled near the bottom (tolerance of 10px)
+        const threshold = 10;
+        isScrolledToBottom = logOutput.scrollHeight - logOutput.scrollTop - logOutput.clientHeight < threshold;
+      });
+  
+      // Function to add a log message
+      function addLogMessage(message: string) {
+        if (!logOutput) return;
+         // Simple timestamp
+         const timestamp = new Date().toLocaleTimeString();
+         const logLine = `[${timestamp}] ${message}\n`;
+         logOutput.textContent += logLine;
+  
+         // Auto-scroll if user hasn't manually scrolled up
+         if (isScrolledToBottom) {
+           logOutput.scrollTop = logOutput.scrollHeight;
+         }
+      }
+  
+      // Clear initial "Connecting..." message once connected or logs start arriving
+      let firstLogReceived = false;
+      function handleFirstLog(message: string) {
+         if (!firstLogReceived && logOutput) {
+             logOutput.textContent = ''; // Clear initial message
+             firstLogReceived = true;
+         }
+         addLogMessage(message);
+      }
+  
+      // Subscribe to logs
+      const unsubscribeLogs = wsManager.onLog(handleFirstLog);
+  
+      // Subscribe to errors
+      const unsubscribeErrors = wsManager.onError((error) => {
+         handleFirstLog(`ERROR: ${error}`); // Display errors in the log console too
+      });
+  
+       // Update console based on initial status too
+       const unsubscribeStatus = wsManager.onStatusChange((status) => {
+          if (!firstLogReceived && status !== 'disconnected') {
+               if (logOutput) logOutput.textContent = ''; // Clear "Connecting..." if connected
+               firstLogReceived = true;
+          }
+          if (status === 'disconnected') {
+             addLogMessage("Connection lost. Attempting to reconnect...");
+          } else if (status === 'connected' && firstLogReceived) {
+              // Optional: Log successful connection/reconnection
+              // addLogMessage("Connection established.");
+          }
+       });
+  
+    } else {
+      console.error("Log output element not found.");
+    }
+  </script>

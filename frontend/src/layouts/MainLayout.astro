@@ -1,0 +1,43 @@
+---
+// frontend/src/layouts/MainLayout.astro (REVISED)
+import '../styles/global.css';
+
+interface Props {
+	title: string;
+}
+
+const { title } = Astro.props;
+---
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="description" content="Oncology Phrase Processor" />
+		<meta name="viewport" content="width=device-width" />
+		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+		<meta name="generator" content={Astro.generator} />
+		<title>{title}</title>
+	</head>
+	<body>
+    <div class="main-grid">
+      <header class="header-area">
+        <h1>{title}</h1>
+        <div id="connection-status" class="status-indicator status-disconnected">Disconnected</div>
+      </header>
+
+      <div class="input-area">
+        <slot name="input" /> {/* Slot for InputForm */}
+      </div>
+
+      <div class="graph-area">
+        <slot name="graph" /> {/* Slot for GraphVisualizer */}
+      </div>
+
+      <div class="logs-area">
+        <slot name="logs" /> {/* Slot for LogConsole */}
+      </div>
+
+    </div>
+    <!-- Components will import and initialize websocket manager -->
+	</body>
+</html>
