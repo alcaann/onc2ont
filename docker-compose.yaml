@@ -1,63 +1,79 @@
-# --- START OF FILE docker-compose.yml ---
+# --- START OF MODIFIED docker-compose.yml ---
 services:
   db:
-    image: postgres:15 # Use a specific PostgreSQL version
+    image: postgres:15
     container_name: umls_postgres_db
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # - ./db_init:/docker-entrypoint-initdb.d # Optional init scripts
     environment:
-      # Ensure these match the actual credentials used
       POSTGRES_DB: ${POSTGRES_DB:-umls_db}
       POSTGRES_USER: ${POSTGRES_USER:-umls_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_very_secure_password_here} # Use env var or Docker secrets for production
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_very_secure_password_here}
+    # Map host port 5433 to container port 5432 for external DB tools
     ports:
-      # Map internal DB port 5432 to host port 5433 (for external tools if needed)
       - "5433:5432"
     networks:
       - umls_net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -q || exit 1"] # Exit 1 on failure
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -q || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped # Optional: Restart policy
+    restart: unless-stopped
 
-  app:
+  app: # Backend Python/FastAPI service
     build:
-      context: .
+      context: . # Build using the top-level Dockerfile
       dockerfile: Dockerfile
     container_name: umls_processor_app
     environment:
-      LOG_LEVEL: ${LOG_LEVEL:-INFO} # Allow overriding log level via .env file or environment
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       POSTGRES_DB: ${POSTGRES_DB:-umls_db}
       POSTGRES_USER: ${POSTGRES_USER:-umls_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_very_secure_password_here} # Use env var or Docker secrets for production
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_very_secure_password_here}
       DB_HOST: db
-      DB_PORT: 5432 # App connects to DB internally on 5432
-      # PYTHONUNBUFFERED: 1 # Set in Dockerfile
-      # PYTHONPATH: /app:/app/scripts # Set in Dockerfile
+      DB_PORT: 5432
+      # PYTHON variables set in Dockerfile
     volumes:
-      # Mount the source UMLS data read-only
+      # Mount the source UMLS data read-only (Keep this)
       - ./data/source/umls/META:/app/data/source/umls/META:ro
-      # Mount local code for development; remove for production builds
-      - .:/app:rw
+      # --- RE-ADD Mount local code for backend development & hot-reloading ---
+      - ./api:/app/api:rw
+      - ./scripts:/app/scripts:rw
+      # Note: If you modify requirements.txt, you WILL need to rebuild the image.
+      # Note: Ensure entrypoint.sh is copied via Dockerfile, not mounted, unless intended.
     networks:
       - umls_net
     depends_on:
       db:
-        condition: service_healthy # Wait for DB to be ready
+        condition: service_healthy
+    # --- REMOVED Port mapping ---
+    # ports:
+    #   - "8000:8000" # No longer expose backend directly to host (Nginx will proxy)
+    # --- RE-ADD --reload for development ---
+    # Make sure uvicorn is installed with [standard] in requirements.txt for watchfiles
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/api --reload-dir /app/scripts
+    restart: unless-stopped
+
+  frontend: # New Frontend Nginx service
+    build:
+      context: ./frontend # Build using the frontend/Dockerfile
+      dockerfile: Dockerfile
+    container_name: umls_frontend_nginx
     ports:
-      # Map host port 8000 to container port 8000 (for the FastAPI app)
-      - "8000:8000"
-    # Override the default CMD from Dockerfile to run the FastAPI server
-    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
-    restart: unless-stopped # Optional: Restart policy
+      # Map host port 8080 to container port 80 (Nginx default)
+      # Access the app via http://localhost:8080
+      - "8080:80"
+    networks:
+      - umls_net
+    depends_on:
+      - app # Optional, but good practice. Nginx proxy handles backend failures.
+    restart: unless-stopped
 
 networks:
   umls_net:
     driver: bridge
 
 volumes:
-  postgres_data: # Define the named volume for persistent DB data
-# --- END OF FILE docker-compose.yml ---
+  postgres_data:
+# --- END OF MODIFIED docker-compose.yml ---
