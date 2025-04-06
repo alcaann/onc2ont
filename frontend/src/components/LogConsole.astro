@@ -1,72 +1,184 @@
 ---
-// frontend/src/components/LogConsole.astro
+// frontend/src/components/LogConsole.astro (REVISED for Controls)
+import { Icon } from 'astro-icon/components'; // Import Icon component
 ---
-<div class="log-section">
-    <h2>Processing Logs</h2>
+<div class="log-section"> {/* Needs position: relative */}
+    <div class="log-header">
+        <h2>Processing Logs</h2>
+        {/* Container for Log Control Buttons */}
+        <div class="log-controls">
+            <button id="log-font-increase-btn" title="Increase Font Size" aria-label="Increase font size">
+                <Icon name="heroicons:plus" size={16} />
+            </button>
+            <button id="log-font-decrease-btn" title="Decrease Font Size" aria-label="Decrease font size">
+                <Icon name="heroicons:minus" size={16} />
+            </button>
+            <button id="log-clear-btn" title="Clear Logs" aria-label="Clear logs">
+                <Icon name="heroicons:trash" size={16} />
+            </button>
+        </div>
+    </div>
     <pre id="log-output" class="log-console">Connecting...</pre>
-  </div>
-  
-  <script>
+</div>
+
+<script>
     import { wsManager } from '../lib/websocket';
-  
-    const logOutput = document.getElementById('log-output');
+
+    // --- Elements ---
+    const logOutput = document.getElementById('log-output') as HTMLPreElement | null;
+    const increaseBtn = document.getElementById('log-font-increase-btn') as HTMLButtonElement | null;
+    const decreaseBtn = document.getElementById('log-font-decrease-btn') as HTMLButtonElement | null;
+    const clearBtn = document.getElementById('log-clear-btn') as HTMLButtonElement | null;
+
+    // --- Font Size State & Config ---
+    const FONT_STEP = 0.1;
+    const MIN_FONT_SIZE = 0.6; // Minimum em size
+    const MAX_FONT_SIZE = 1.5; // Maximum em size
+    const INITIAL_FONT_SIZE = 0.9; // Default em size
+    let currentFontSize = INITIAL_FONT_SIZE;
     let isScrolledToBottom = true; // Auto-scroll state
-  
-    if (logOutput) {
-      // Check scroll position before updating content
-      logOutput.addEventListener('scroll', () => {
-        // Check if scrolled near the bottom (tolerance of 10px)
-        const threshold = 10;
-        isScrolledToBottom = logOutput.scrollHeight - logOutput.scrollTop - logOutput.clientHeight < threshold;
-      });
-  
-      // Function to add a log message
-      function addLogMessage(message: string) {
+    let firstLogReceived = false; // Track initial message
+
+    // --- Functions ---
+    function updateFontSize(newSize: number) {
         if (!logOutput) return;
-         // Simple timestamp
-         const timestamp = new Date().toLocaleTimeString();
-         const logLine = `[${timestamp}] ${message}\n`;
-         logOutput.textContent += logLine;
-  
-         // Auto-scroll if user hasn't manually scrolled up
-         if (isScrolledToBottom) {
-           logOutput.scrollTop = logOutput.scrollHeight;
-         }
-      }
-  
-      // Clear initial "Connecting..." message once connected or logs start arriving
-      let firstLogReceived = false;
-      function handleFirstLog(message: string) {
-         if (!firstLogReceived && logOutput) {
-             logOutput.textContent = ''; // Clear initial message
-             firstLogReceived = true;
-         }
-         addLogMessage(message);
-      }
-  
-      // Subscribe to logs
-      const unsubscribeLogs = wsManager.onLog(handleFirstLog);
-  
-      // Subscribe to errors
-      const unsubscribeErrors = wsManager.onError((error) => {
-         handleFirstLog(`ERROR: ${error}`); // Display errors in the log console too
-      });
-  
-       // Update console based on initial status too
-       const unsubscribeStatus = wsManager.onStatusChange((status) => {
-          if (!firstLogReceived && status !== 'disconnected') {
-               if (logOutput) logOutput.textContent = ''; // Clear "Connecting..." if connected
-               firstLogReceived = true;
-          }
-          if (status === 'disconnected') {
-             addLogMessage("Connection lost. Attempting to reconnect...");
-          } else if (status === 'connected' && firstLogReceived) {
-              // Optional: Log successful connection/reconnection
-              // addLogMessage("Connection established.");
-          }
-       });
-  
-    } else {
-      console.error("Log output element not found.");
+        // Clamp the size within limits
+        currentFontSize = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, newSize));
+        logOutput.style.fontSize = `${currentFontSize}em`;
+        console.log(`Log font size set to: ${currentFontSize}em`);
+        // Optionally disable buttons at limits (optional)
+        if (decreaseBtn) decreaseBtn.disabled = currentFontSize <= MIN_FONT_SIZE;
+        if (increaseBtn) increaseBtn.disabled = currentFontSize >= MAX_FONT_SIZE;
     }
-  </script>
+
+    function addLogMessage(message: string) {
+      if (!logOutput) return;
+      const timestamp = new Date().toLocaleTimeString();
+      const logLine = `[${timestamp}] ${message}\n`;
+
+       // Clear initial message only once
+      if (!firstLogReceived) {
+           logOutput.textContent = ''; // Clear "Connecting..."
+           firstLogReceived = true;
+      }
+      logOutput.textContent += logLine;
+
+      if (isScrolledToBottom) {
+        logOutput.scrollTop = logOutput.scrollHeight;
+      }
+    }
+
+    // --- Event Listeners & Initial Setup ---
+    if (logOutput) {
+        // Set initial font size
+        updateFontSize(currentFontSize);
+
+        // Scroll handling
+        logOutput.addEventListener('scroll', () => {
+            if (!logOutput) return;
+            const threshold = 10;
+            isScrolledToBottom = logOutput.scrollHeight - logOutput.scrollTop - logOutput.clientHeight < threshold;
+        });
+
+        // Button Listeners
+        if (increaseBtn) {
+            increaseBtn.onclick = () => updateFontSize(currentFontSize + FONT_STEP);
+        }
+        if (decreaseBtn) {
+            decreaseBtn.onclick = () => updateFontSize(currentFontSize - FONT_STEP);
+        }
+        if (clearBtn) {
+            clearBtn.onclick = () => {
+                logOutput.textContent = ''; // Clear content
+                // Optional: Add a small message indicating clearance
+                // addLogMessage("Logs cleared.");
+            };
+        }
+
+        // WebSocket Subscriptions
+        const unsubscribeLogs = wsManager.onLog(addLogMessage);
+        const unsubscribeErrors = wsManager.onError((error) => {
+            addLogMessage(`ERROR: ${error}`);
+        });
+        const unsubscribeStatus = wsManager.onStatusChange((status) => {
+            if (!firstLogReceived && status !== 'disconnected') {
+                if (logOutput) logOutput.textContent = '';
+                firstLogReceived = true;
+            }
+            if (status === 'disconnected' && firstLogReceived) { // only log reconnect if we were previously connected
+               addLogMessage("Connection lost. Attempting to reconnect...");
+            }
+        });
+
+    } else {
+        console.error("Log output element not found.");
+        // Disable buttons if log output isn't found
+        if (increaseBtn) increaseBtn.disabled = true;
+        if (decreaseBtn) decreaseBtn.disabled = true;
+        if (clearBtn) clearBtn.disabled = true;
+    }
+
+</script>
+
+<style is:global>
+    /* --- Add CSS for the log controls --- */
+    .log-section {
+        position: relative; /* Needed for absolute positioning of children */
+    }
+
+    /* Container to hold title and controls side-by-side */
+    .log-header {
+        display: flex;
+        justify-content: space-between; /* Pushes title left, controls right */
+        align-items: center; /* Vertically align title and controls */
+        margin-bottom: 0.5rem; /* Space below header */
+        /* Adjust flex-wrap if needed on very small screens, though unlikely */
+    }
+
+    .log-header h2 {
+        margin-bottom: 0; /* Remove default margin from h2 */
+    }
+
+    .log-controls {
+        /* Removed absolute positioning, using flexbox in header now */
+        /* position: absolute; top: 1rem; right: 1rem; */
+        z-index: 10;
+        display: flex;
+        gap: 0.5rem;
+        flex-shrink: 0; /* Prevent controls from shrinking */
+    }
+
+    /* Use the same button styles as graph controls */
+    .graph-controls button,
+    .log-controls button {
+        background-color: rgba(255, 255, 255, 0.8);
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        padding: 0.3rem;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        line-height: 1;
+        transition: background-color 0.2s ease, border-color 0.2s ease;
+        color: #333;
+    }
+
+    .graph-controls button:hover:not(:disabled),
+    .log-controls button:hover:not(:disabled) {
+        background-color: rgba(240, 240, 240, 0.9);
+        border-color: #aaa;
+    }
+
+    .graph-controls button:disabled,
+    .log-controls button:disabled {
+        cursor: not-allowed;
+        opacity: 0.5;
+    }
+
+    .graph-controls button .icon,
+    .log-controls button .icon {
+        display: block;
+    }
+    /* --- End CSS for log controls --- */
+</style>

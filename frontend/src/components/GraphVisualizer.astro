@@ -1,11 +1,15 @@
 ---
-// frontend/src/components/GraphVisualizer.astro (REVISED)
+// frontend/src/components/GraphVisualizer.astro (REVISED - Restore Data Mapping)
+import { Icon } from 'astro-icon/components';
 ---
 <div class="graph-section">
     <h2>Concept Graph</h2>
-    <div id="cy-container">
-        <!-- Cytoscape graph will be rendered here -->
+    <div class="graph-controls">
+        <button id="zoom-in-btn" title="Zoom In" aria-label="Zoom In" disabled><Icon name="heroicons:magnifying-glass-plus-solid" size={18} /></button>
+        <button id="zoom-out-btn" title="Zoom Out" aria-label="Zoom Out" disabled><Icon name="heroicons:magnifying-glass-minus-solid" size={18} /></button>
+        <button id="reset-view-btn" title="Reset View" aria-label="Reset View" disabled><Icon name="heroicons:arrows-pointing-out" size={18} /></button>
     </div>
+    <div id="cy-container"></div>
 </div>
 
 <script>
@@ -13,128 +17,116 @@
     import { wsManager } from '../lib/websocket';
 
     const cyContainer = document.getElementById('cy-container');
-    let cyInstance = null; // To hold the Cytoscape instance
+    const zoomInBtn = document.getElementById('zoom-in-btn') as HTMLButtonElement;
+    const zoomOutBtn = document.getElementById('zoom-out-btn') as HTMLButtonElement;
+    const resetViewBtn = document.getElementById('reset-view-btn') as HTMLButtonElement;
+    let cyInstance = null;
+    let resizeTimeout = null;
 
-    // Basic Cytoscape styling (Keep as is)
-    const cyStyle = [
-        { selector: 'node', style: { 'background-color': '#007bff', 'label': 'data(label)', 'color': '#333', 'font-size': '10px', 'text-valign': 'center', 'text-halign': 'center', 'width': 'label', 'height': 'label', 'padding': '8px', 'shape': 'round-rectangle', 'border-width': 1, 'border-color': '#0056b3' } },
-        { selector: 'node[type="DISEASE"]', style: { 'background-color': '#dc3545', 'border-color': '#b02a37' } },
-        { selector: 'node[type="CHEMICAL"]', style: { 'background-color': '#ffc107', 'border-color': '#cc9a06' } },
-        { selector: 'node[type="OTHER"]', style: { 'background-color': '#6c757d', 'border-color': '#5a6268' } }, // Style for 'OTHER'
-        { selector: 'edge', style: { 'width': 2, 'line-color': '#6c757d', 'target-arrow-color': '#6c757d', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'label': 'data(label)', 'font-size': '9px', 'color': '#444', 'text-rotation': 'autorotate', 'text-background-opacity': 1, 'text-background-color': '#ffffff', 'text-background-padding': '2px', 'text-background-shape': 'round-rectangle' } }
-    ]; // Added OTHER style, ensure your full styles are here
+    // --- Styles, Layout Options (Keep as is) ---
+    const cyStyle = [ { selector: 'node', style: { 'background-color': '#007bff', 'label': 'data(label)', 'color': '#333', 'font-size': '10px', 'text-valign': 'center', 'text-halign': 'center', 'width': 'label', 'height': 'label', 'padding': '8px', 'shape': 'round-rectangle', 'border-width': 1, 'border-color': '#0056b3' } }, { selector: 'node[type="DISEASE"]', style: { 'background-color': '#dc3545', 'border-color': '#b02a37' } }, { selector: 'node[type="CHEMICAL"]', style: { 'background-color': '#ffc107', 'border-color': '#cc9a06' } }, { selector: 'node[type="OTHER"]', style: { 'background-color': '#6c757d', 'border-color': '#5a6268' } }, { selector: 'edge', style: { 'width': 2, 'line-color': '#6c757d', 'target-arrow-color': '#6c757d', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'label': 'data(label)', 'font-size': '9px', 'color': '#444', 'text-rotation': 'autorotate', 'text-background-opacity': 1, 'text-background-color': '#ffffff', 'text-background-padding': '2px', 'text-background-shape': 'round-rectangle' } } ];
+    const cyLayoutOptions = { name: 'breadthfirst', fit: true, padding: 30, directed: true, spacingFactor: 1.75 };
 
-    // Layout options - START WITH A SIMPLER ONE
-    const cyLayoutOptions = {
-        name: 'breadthfirst', // Often good for directed graphs, simpler than cose
-        fit: true,       // Fit the viewport to the graph
-        padding: 30,     // Padding around layout
-        directed: true,  // Treat edges as directed
-        spacingFactor: 1.75, // Increase spacing
-        // grid: false // Use grid coordinates (alternative)
-    };
-    // const coseLayoutOptions = { name: 'cose', /* ... keep your cose options here for later if needed ... */ };
+    // --- Helper Functions (Keep as is) ---
+    function runLayout(instance) { if (!instance) return; console.log("[GraphVisualizer.astro] Running layout..."); const layout = instance.layout(cyLayoutOptions); layout.run(); console.log("[GraphVisualizer.astro] Layout finished."); }
+    function setControlsDisabled(disabled: boolean) { if (zoomInBtn) zoomInBtn.disabled = disabled; if (zoomOutBtn) zoomOutBtn.disabled = disabled; if (resetViewBtn) resetViewBtn.disabled = disabled; }
 
-
-    function runLayout(instance) {
-        if (!instance) return;
-        console.log("[GraphVisualizer.astro] Running layout...");
-        const layout = instance.layout(cyLayoutOptions); // Use the simpler layout first
-        layout.run();
-        console.log("[GraphVisualizer.astro] Layout finished.");
-    }
-
-    // Function to initialize or update the Cytoscape graph
+    // --- Graph Update Function ---
     function initializeOrUpdateGraph(concepts = [], relations = []) {
          console.log('[GraphVisualizer.astro] initializeOrUpdateGraph called.');
-         console.log('[GraphVisualizer.astro] Concepts received:', concepts);
-         console.log('[GraphVisualizer.astro] Relations received:', relations);
-
-        if (!cyContainer) {
-            console.error("[GraphVisualizer.astro] Cytoscape container not found.");
-            return;
-        }
-        // Ensure container has dimensions before initializing
-        if (cyContainer.clientHeight === 0 || cyContainer.clientWidth === 0) {
-             console.warn("[GraphVisualizer.astro] Cytoscape container has zero dimensions. Delaying graph update slightly.");
-             // Delay slightly to allow rendering/CSS to apply
-             setTimeout(() => initializeOrUpdateGraph(concepts, relations), 100);
-             return;
-        }
+        if (!cyContainer) return console.error("[GraphVisualizer.astro] Cytoscape container not found.");
+        setControlsDisabled(true);
+        if (cyContainer.clientHeight === 0 || cyContainer.clientWidth === 0) { console.warn("[GraphVisualizer.astro] Cytoscape container has zero dimensions..."); setTimeout(() => initializeOrUpdateGraph(concepts, relations), 100); return; }
 
         try {
+            // --- RESTORED FULL MAPPING ---
             const nodes = concepts.map(concept => ({
                 data: {
-                    id: concept.cui,
-                    label: concept.text_span || concept.matched_term,
+                    id: concept.cui, // Use CUI as unique node ID
+                    label: concept.text_span || concept.matched_term, // Display original text or matched term
+                    // Add other concept data for tooltips/popups later
                     full_term: concept.matched_term,
                     cui: concept.cui,
                     code: concept.code,
                     sem_types: concept.sem_types?.join(', ') || 'N/A',
-                    // Ensure 'OTHER' is the default
+                    // Map type for styling
                     type: concept.sem_types?.some(st => ["Neoplastic Process", "Disease or Syndrome"].includes(st)) ? "DISEASE" :
-                          concept.sem_types?.some(st => ["Pharmacologic Substance", "Clinical Drug"].includes(st)) ? "CHEMICAL" :
+                          concept.sem_types?.some(st => ["Pharmacologic Substance", "Clinical Drug", "Chemical"].includes(st)) ? "CHEMICAL" :
                           "OTHER"
                 }
             }));
-            console.log('[GraphVisualizer.astro] Mapped Nodes:', nodes);
-
             const edges = relations.map((rel, index) => ({
                 data: {
-                    id: `e${index}_${rel.subject_cui}_${rel.object_cui}`,
-                    source: rel.subject_cui,
-                    target: rel.object_cui,
-                    label: rel.relation || 'related'
+                    id: `e${index}_${rel.subject_cui}_${rel.object_cui}`, // Create a unique edge ID
+                    source: rel.subject_cui, // CUI of source node
+                    target: rel.object_cui, // CUI of target node
+                    label: rel.relation || 'related' // Relation type as label
                 }
             }));
-            console.log('[GraphVisualizer.astro] Mapped Edges:', edges);
+            // --- END RESTORED MAPPING ---
 
             const elements = [...nodes, ...edges];
+            console.log('[GraphVisualizer.astro] Mapped Elements:', elements);
 
             if (!cyInstance) {
                 console.log("[GraphVisualizer.astro] Initializing new Cytoscape instance.");
-                cyInstance = cytoscape({
-                    container: cyContainer,
-                    elements: elements,
-                    style: cyStyle,
-                    // Don't run layout immediately, do it after mount/render
-                });
-
-                 // Add Tooltip Interaction (Keep as is)
-                 cyInstance.on('mouseover', 'node', function(event){ /* ... tooltip logic ... */ const node = event.target; const nodeData = node.data(); let tooltip = document.getElementById('cy-tooltip'); if (!tooltip) { tooltip = document.createElement('div'); tooltip.id = 'cy-tooltip'; /* styles... */ document.body.appendChild(tooltip); } tooltip.style.left = event.originalEvent.clientX + 10 + 'px'; tooltip.style.top = event.originalEvent.clientY + 10 + 'px'; tooltip.innerHTML = `<strong>${nodeData.label}</strong><br>CUI: ${nodeData.cui}<br>Term: ${nodeData.full_term}<br>Types: ${nodeData.sem_types}`; tooltip.style.display = 'block';});
-                 cyInstance.on('mouseout', 'node', function(event){ /* ... hide tooltip ... */ let tooltip = document.getElementById('cy-tooltip'); if (tooltip) tooltip.style.display = 'none'; });
-
-                 // Run layout after initial creation
-                 runLayout(cyInstance);
-
+                cyInstance = cytoscape({ container: cyContainer, elements: elements, style: cyStyle });
+                // --- Tooltips (Keep full logic) ---
+                cyInstance.on('mouseover', 'node', function(event){ const node = event.target; const nodeData = node.data(); let tooltip = document.getElementById('cy-tooltip'); if (!tooltip) { tooltip = document.createElement('div'); tooltip.id = 'cy-tooltip'; tooltip.style.position = 'absolute'; tooltip.style.padding = '5px 8px'; tooltip.style.background = 'rgba(0, 0, 0, 0.75)'; tooltip.style.color = 'white'; tooltip.style.fontSize = '12px'; tooltip.style.borderRadius = '3px'; tooltip.style.pointerEvents = 'none'; tooltip.style.display = 'none'; tooltip.style.zIndex = '1000'; tooltip.style.whiteSpace = 'pre-wrap'; document.body.appendChild(tooltip); } tooltip.style.left = event.originalEvent.clientX + 15 + 'px'; tooltip.style.top = event.originalEvent.clientY + 15 + 'px'; tooltip.innerHTML = `<strong>${nodeData.label}</strong><br>CUI: ${nodeData.cui}<br>Term: ${nodeData.full_term}<br>Types: ${nodeData.sem_types}`; tooltip.style.display = 'block'; });
+                cyInstance.on('mouseout', 'node', function(event){ let tooltip = document.getElementById('cy-tooltip'); if (tooltip) tooltip.style.display = 'none'; });
+                cyInstance.on('position', 'node', function(event){ let tooltip = document.getElementById('cy-tooltip'); if (tooltip && tooltip.style.display === 'block') { const renderedPosition = event.target.renderedPosition(); tooltip.style.left = renderedPosition.x + 15 + 'px'; tooltip.style.top = renderedPosition.y + 15 + 'px'; } });
+                // --- Button Listeners (Keep full logic) ---
+                if (zoomInBtn) { zoomInBtn.onclick = () => { if (cyInstance) cyInstance.zoom({ level: cyInstance.zoom() * 1.2, renderedPosition: { x: cyInstance.width() / 2, y: cyInstance.height() / 2 } }); }; }
+                if (zoomOutBtn) { zoomOutBtn.onclick = () => { if (cyInstance) cyInstance.zoom({ level: cyInstance.zoom() / 1.2, renderedPosition: { x: cyInstance.width() / 2, y: cyInstance.height() / 2 } }); }; }
+                if (resetViewBtn) { resetViewBtn.onclick = () => { if (cyInstance) cyInstance.fit(undefined, 30); }; }
+                // --- Resize Listener (Keep full logic) ---
+                window.addEventListener('resize', handleResize);
+                // --- Run Layout ---
+                runLayout(cyInstance);
             } else {
                 console.log("[GraphVisualizer.astro] Updating existing Cytoscape instance.");
-                cyInstance.elements().remove();
-                cyInstance.add(elements);
-                // Run layout after adding elements
+                cyInstance.json({ elements: elements });
                 runLayout(cyInstance);
             }
-             console.log("[GraphVisualizer.astro] Graph update process finished successfully.");
-
+            setControlsDisabled(elements.length === 0);
+            console.log("[GraphVisualizer.astro] Graph update finished.");
         } catch (error) {
-            console.error("[GraphVisualizer.astro] Error during graph update:", error);
-            if (cyContainer) {
-                cyContainer.textContent = `Error updating graph: ${error.message}. Check console.`;
-                cyContainer.style.color = 'red';
-            }
+             console.error("[GraphVisualizer.astro] Error during graph update:", error);
+             setControlsDisabled(true);
+             if (cyContainer) { cyContainer.textContent = `Error updating graph: ${error.message}. Check console.`; cyContainer.style.color = 'red'; }
         }
     }
 
-    // Subscribe to results from WebSocket manager
-    const unsubscribeResult = wsManager.onResult((data) => {
-        console.log('[GraphVisualizer.astro] onResult callback triggered. Data:', data);
+    // --- WebSocket Subscription (Keep as is) ---
+    wsManager.onResult((data) => {
+        console.log('[GraphVisualizer.astro] onResult (WebSocket) callback triggered. DATA:', data);
+        console.log('[GraphVisualizer.astro] CALLING initializeOrUpdateGraph from WebSocket result.');
         initializeOrUpdateGraph(data.concepts, data.relations);
     });
 
-    // Initialize with an empty graph on load, maybe after a short delay
+    // --- Custom Event Listener (Keep as is) ---
+    function handleGraphDataUpdate(event) {
+         console.log('[GraphVisualizer.astro] Received update-graph-data event:', event.detail);
+         if (event.detail && Array.isArray(event.detail.concepts) && Array.isArray(event.detail.relations)) {
+             initializeOrUpdateGraph(event.detail.concepts, event.detail.relations);
+         } else {
+             console.warn('[GraphVisualizer.astro] Invalid data received in update-graph-data event.');
+         }
+    }
+    document.body.addEventListener('update-graph-data', handleGraphDataUpdate);
+
+    // --- Resize Handler (Keep as is) ---
+    function handleResize() {
+        if (cyInstance) { clearTimeout(resizeTimeout); resizeTimeout = setTimeout(() => { console.log("[GraphVisualizer.astro] Window resized..."); cyInstance.resize(); cyInstance.fit(undefined, 30); }, 250); }
+    }
+
+    // --- Initial Empty Graph Render (Keep as is) ---
     console.log('[GraphVisualizer.astro] Initializing empty graph on component load.');
-    // Use setTimeout to ensure the container is likely rendered by the browser
     setTimeout(() => initializeOrUpdateGraph(), 0);
 
+    // --- Optional Cleanup (Keep commented out) ---
+    // window.addEventListener('beforeunload', () => { /* ... */ });
 
 </script>
+
+{/* Style block removed - styles are in global.css */}

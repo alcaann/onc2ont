@@ -1,5 +1,5 @@
 ---
-// frontend/src/layouts/MainLayout.astro (REVISED)
+// frontend/src/layouts/MainLayout.astro (REVISED for 4 components)
 import '../styles/global.css';
 
 interface Props {
@@ -13,31 +13,37 @@ const { title } = Astro.props;
 	<head>
 		<meta charset="UTF-8" />
 		<meta name="description" content="Oncology Phrase Processor" />
-		<meta name="viewport" content="width=device-width" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 		<meta name="generator" content={Astro.generator} />
 		<title>{title}</title>
 	</head>
 	<body>
-    <div class="main-grid">
+    <div class="app-container">
       <header class="header-area">
         <h1>{title}</h1>
         <div id="connection-status" class="status-indicator status-disconnected">Disconnected</div>
       </header>
 
-      <div class="input-area">
-        <slot name="input" /> {/* Slot for InputForm */}
+      {/* TOP Row: Input and Graph */}
+      <div class="content-row-wrap-top">
+        <div class="input-area">
+          <slot name="input" />
+        </div>
+        <div class="graph-area">
+          <slot name="graph" />
+        </div>
       </div>
 
-      <div class="graph-area">
-        <slot name="graph" /> {/* Slot for GraphVisualizer */}
+      {/* BOTTOM Row: Logs and JSON Editor */}
+      <div class="content-row-wrap-bottom">
+        <div class="logs-area">
+          <slot name="logs" />
+        </div>
+        <div class="json-editor-area">
+          <slot name="json-editor" /> {/* New slot */}
+        </div>
       </div>
-
-      <div class="logs-area">
-        <slot name="logs" /> {/* Slot for LogConsole */}
-      </div>
-
     </div>
-    <!-- Components will import and initialize websocket manager -->
 	</body>
 </html>

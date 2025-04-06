@@ -1,0 +1,157 @@
+---
+// frontend/src/components/JsonEditor.astro (REVISED - Save Button)
+import { Icon } from 'astro-icon/components';
+---
+<div class="json-editor-section">
+    <div class="json-editor-header">
+        <h2>Model Output (JSON)</h2>
+        <div class="json-controls">
+            <button id="json-font-increase-btn" title="Increase Font Size" aria-label="Increase font size">
+                <Icon name="heroicons:plus" size={16} />
+            </button>
+            <button id="json-font-decrease-btn" title="Decrease Font Size" aria-label="Decrease font size">
+                <Icon name="heroicons:minus" size={16} />
+            </button>
+            <button id="json-format-btn" title="Format JSON" aria-label="Format JSON">
+                <Icon name="heroicons:code-bracket-square" size={16} />
+            </button>
+             {/* Changed Clear to Save/Update Graph */}
+            <button id="json-update-graph-btn" title="Update Graph from JSON" aria-label="Update graph from JSON">
+                 <Icon name="heroicons:arrow-path" size={16} /> {/* Refresh/Update icon */}
+                 {/* Alt icon: <Icon name="heroicons:check-circle" size={16} /> */}
+            </button>
+        </div>
+    </div>
+    {/* Container where CodeMirror will mount */}
+    <div id="json-editor-container"></div>
+</div>
+
+<script>
+    import { EditorView, basicSetup } from "codemirror";
+    import { EditorState } from "@codemirror/state";
+    import { json, jsonParseLinter } from "@codemirror/lang-json";
+    import { linter, lintGutter } from "@codemirror/lint";
+    import { wsManager } from '../lib/websocket';
+
+    // --- Elements ---
+    const editorContainer = document.getElementById('json-editor-container');
+    const increaseBtn = document.getElementById('json-font-increase-btn') as HTMLButtonElement | null;
+    const decreaseBtn = document.getElementById('json-font-decrease-btn') as HTMLButtonElement | null;
+    const formatBtn = document.getElementById('json-format-btn') as HTMLButtonElement | null;
+    const updateGraphBtn = document.getElementById('json-update-graph-btn') as HTMLButtonElement | null; // Changed ID
+
+    // --- Font Size State & Config ---
+    const FONT_STEP = 0.1; const MIN_FONT_SIZE = 0.7; const MAX_FONT_SIZE = 1.6; const INITIAL_FONT_SIZE = 0.9;
+    let currentFontSize = INITIAL_FONT_SIZE;
+
+    let editorView = null;
+
+    // --- Functions ---
+    function updateEditorContent(content: string | object) {
+        if (!editorView) return;
+        const value = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+        editorView.dispatch(editorView.state.update({
+            changes: { from: 0, to: editorView.state.doc.length, insert: value }
+        }));
+        editorView.scrollDOM.scrollTop = 0;
+    }
+
+    function formatJsonContent() {
+        if (!editorView) return;
+        try {
+            const currentContent = editorView.state.doc.toString();
+            if (!currentContent.trim()) return;
+            const parsed = JSON.parse(currentContent);
+            updateEditorContent(parsed);
+        } catch (error) {
+            console.error("Invalid JSON, cannot format:", error);
+            alert("The current content is not valid JSON and cannot be formatted.");
+        }
+    }
+
+    function updateEditorFontSize(newSize: number) {
+        if (!editorView) return;
+        currentFontSize = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, newSize));
+        const cmEditor = editorContainer?.querySelector('.cm-editor');
+        if (cmEditor) { (cmEditor as HTMLElement).style.fontSize = `${currentFontSize}em`; }
+        console.log(`JSON editor font size set to: ${currentFontSize}em`);
+        if (decreaseBtn) decreaseBtn.disabled = currentFontSize <= MIN_FONT_SIZE;
+        if (increaseBtn) increaseBtn.disabled = currentFontSize >= MAX_FONT_SIZE;
+    }
+
+    // --- NEW: Function to handle updating the graph ---
+    function handleUpdateGraphClick() {
+        if (!editorView) return alert("Editor not initialized.");
+        const jsonString = editorView.state.doc.toString();
+        if (!jsonString.trim()) return alert("JSON Editor is empty.");
+
+        try {
+            const parsedData = JSON.parse(jsonString);
+
+            // Basic validation: Check if concepts and relations exist and are arrays
+            if (typeof parsedData !== 'object' || parsedData === null ||
+                !Array.isArray(parsedData.concepts) ||
+                !Array.isArray(parsedData.relations)) {
+                 alert("Invalid JSON structure. Expected an object with 'concepts' and 'relations' arrays.");
+                 return;
+            }
+
+            console.log("[JsonEditor.astro] Dispatching update-graph-data event with:", parsedData);
+
+            // Dispatch a custom event with the parsed data
+            const event = new CustomEvent('update-graph-data', {
+                bubbles: true, // Allow event to bubble up
+                composed: true, // Allow event to cross shadow DOM boundaries (not strictly needed here)
+                detail: parsedData // The parsed { concepts: [], relations: [] } object
+            });
+            // Dispatch on a common ancestor or document body
+            document.body.dispatchEvent(event);
+
+             alert("Graph update triggered with current JSON data.");
+
+        } catch (error) {
+            console.error("Error parsing JSON:", error);
+            alert(`Invalid JSON: ${error.message}`);
+        }
+    }
+
+    // --- Initial Setup ---
+    function initializeEditor() {
+        if (!editorContainer) return console.error("JSON editor container not found.");
+
+        const initialState = EditorState.create({
+            doc: JSON.stringify({ message: "Waiting for model output..." }, null, 2),
+            extensions: [ basicSetup, json(), linter(jsonParseLinter()), lintGutter(), EditorView.lineWrapping, EditorView.theme({ "&": { height: "100%" }, ".cm-scroller": { overflow: "auto" } }) ]
+        });
+        editorView = new EditorView({ state: initialState, parent: editorContainer });
+        updateEditorFontSize(currentFontSize);
+
+        // --- Add Button Event Listeners ---
+        if (increaseBtn) increaseBtn.onclick = () => updateEditorFontSize(currentFontSize + FONT_STEP);
+        if (decreaseBtn) decreaseBtn.onclick = () => updateEditorFontSize(currentFontSize - FONT_STEP);
+        if (formatBtn) formatBtn.onclick = formatJsonContent;
+        if (updateGraphBtn) updateGraphBtn.onclick = handleUpdateGraphClick; // Attach save handler
+
+        // --- WebSocket Subscription ---
+        wsManager.onResult((data) => {
+            console.log('[JsonEditor.astro] onResult callback triggered.');
+            updateEditorContent(data); // Update editor with new results
+        });
+         wsManager.onStatusChange((status) => { /* Optional status handling */ });
+    }
+
+    setTimeout(initializeEditor, 0);
+
+</script>
+
+<style is:global>
+    /* Keep existing styles for .json-editor-section, .json-editor-header, etc. */
+    /* Styles for controls/buttons are handled globally */
+    .json-editor-section { position: relative; display: flex; flex-direction: column; flex-grow: 1; min-height: 0; overflow: hidden; }
+    .json-editor-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; flex-shrink: 0; }
+    .json-editor-header h2 { margin-bottom: 0; }
+    .json-controls { z-index: 10; display: flex; gap: 0.5rem; flex-shrink: 0; }
+    #json-editor-container { flex-grow: 1; min-height: 150px; overflow: hidden; }
+    #json-editor-container .cm-editor { height: 100%; font-size: 0.9em; border: 1px solid #ccc; border-radius: 4px; }
+    #json-editor-container .cm-scroller { overflow-y: auto; }
+</style>

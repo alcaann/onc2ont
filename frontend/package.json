@@ -9,7 +9,16 @@
     "astro": "astro"
   },
   "dependencies": {
+    "@codemirror/basic-setup": "^0.20.0",
+    "@codemirror/commands": "^6.8.1",
+    "@codemirror/lang-json": "^6.0.1",
+    "@codemirror/lint": "^6.8.5",
+    "@codemirror/state": "^6.5.2",
+    "@codemirror/view": "^6.36.5",
+    "@iconify-json/heroicons": "^1.2.2",
     "astro": "^5.6.1",
+    "astro-icon": "^1.1.5",
+    "codemirror": "^6.0.1",
     "cytoscape": "^3.31.2"
   },
   "devDependencies": {
