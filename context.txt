@@ -1,126 +1,211 @@
+```
 --- START OF FILE context.txt ---
 
-**Project Goal:** Develop an AI pipeline for a thesis that takes short oncology patient phrases as input and outputs a list of **NCI Thesaurus (NCIt)** concepts and the detailed relationships between them. The ultimate goal is visualization as an interactive knowledge graph in a web application. (Radiation Oncology Ontology (ROO) integration is deferred).
+**Project Goal:** Develop an AI pipeline for a thesis that takes short oncology patient phrases as input and outputs a list of **NCI Thesaurus (NCIt)** concepts and the detailed relationships between them. The project includes a **web application** for interactive input, visualization as a knowledge graph, viewing processing logs, and examining/editing the raw JSON output. (Radiation Oncology Ontology (ROO) integration is deferred).
 
 **Environment & Data Setup:**
 
-1.  **Environment:** Dockerized using Docker Compose (`docker-compose.yml`).
-2.  **Services:**
-    *   `db`: PostgreSQL 15 (`umls_postgres_db`), using persistent data storage via Docker volume (`postgres_data`). Healthcheck enabled. Port 5432 mapped to host 5433 for external access if needed.
-    *   `app`: Python 3.10 (`umls_processor_app`) image built via `Dockerfile`. Runs as non-root user `appuser`. Port 5000 mapped to host 5000 (currently for potential `displacy` debugging, can be repurposed for web app).
+1.  **Backend Environment:** Dockerized using Docker Compose (`docker-compose.yml`).
+    *   `db`: PostgreSQL 15 (`umls_postgres_db`), using persistent data storage via Docker volume (`postgres_data`). Healthcheck enabled. Port 5432 mapped to host 5433 for external tools.
+    *   `app`: Python 3.10 (`umls_processor_app`) image built via `Dockerfile`. Runs FastAPI backend API via Uvicorn on port 8000 (mapped to host 8000). Provides WebSocket endpoint (`/ws`) for communication. Runs as non-root user `appuser`.
+2.  **Frontend Development Environment (Current):**
+    *   Node.js LTS environment on the host machine.
+    *   Astro framework (`frontend/` directory).
+    *   Uses `npm run dev` for local development server (typically on port 4321).
+    *   Connects to the backend API running in Docker via `ws://localhost:8000/ws`.
 3.  **Data Handling & Status:**
-    *   **UMLS Subset:** Successfully loaded into the persistent PostgreSQL `db` service. Contains `MRCONSO` (terms/codes), `MRSTY` (semantic types), and `MRREL` (relationships) from UMLS. Includes **NCI Thesaurus (SAB='NCI')** data. Data confirmed to persist across container restarts. `pg_trgm` extension enabled for efficient text searching.
-    *   **Database Connection:** `psycopg2-binary` used for DB connection from `app`. Connection details passed via environment variables.
+    *   **UMLS Subset:** Successfully loaded into the persistent PostgreSQL `db` service. Contains `MRCONSO`, `MRSTY`, `MRREL` from UMLS, including **NCI Thesaurus (SAB='NCI')**. Data persists across restarts. `pg_trgm` extension enabled.
+    *   **Database Connection:** `psycopg2-binary` used for DB connection from `app`. Connection details via environment variables.
     *   **Source Data Mount:** Host UMLS RRF source (`./data/source/umls/META`) mounted read-only into `app` at `/app/data/source/umls/META`.
 
-**Core Pipeline Strategy (Current):**
+**Core Backend Pipeline Strategy & Key Functions:**
 
-The pipeline implemented in `scripts/process_phrase.py` follows these steps:
+Implemented primarily across `api/main.py`, `scripts/process_phrase.py`, `scripts/relation_extractor.py`, and `scripts/db_utils.py`.
 
-1.  **NLP Processing:** The input phrase is processed by `spacy` using the `en_ner_bc5cdr_md` model (with default components including tagger, parser, ner).
-2.  **NER Concept Extraction:**
-    *   Entities are identified by the ScispaCy NER component (`doc.ents`).
-    *   For each NER entity (`ent.text`, `ent.label_`):
-        *   **Term-to-Concept (TTC):** Call `get_filtered_db_matches` to find matching NCIt concepts.
-            *   Queries `mrconso` (SAB='NCI') via `find_concept_by_term_and_source` (exact match preferred, falls back to partial).
-            *   Retrieves semantic types via `get_semantic_types_for_cui`.
-            *   Filters candidates based on explicit exclusions (`EXCLUDE_SEMANTIC_TYPES`) and compatibility between NER label and UMLS types (`LABEL_TO_SEMANTIC_TYPES`).
-            *   **Ranks** valid candidates using scoring (exact match bonus + `rapidfuzz` similarity).
-        *   Selects the top-ranked, non-duplicate concept for the phrase.
-3.  **Fallback Token-Based Concept Detection:**
-    *   Iterates through individual tokens in the `doc`.
-    *   Skips tokens that overlap with spans already processed by NER.
-    *   Skips tokens whose Part-of-Speech (POS) tag is not in `FALLBACK_POS_TAGS` (`NOUN`, `PROPN`, `ADJ`).
-    *   For remaining tokens (`token.text`):
-        *   **TTC (High Confidence):** Call `get_filtered_db_matches` (label="UNKNOWN").
-        *   Selects the top-ranked match *only if* its score meets a strict `FALLBACK_SCORE_THRESHOLD` (requiring exact match).
-        *   Adds the non-duplicate concept to the list.
-4.  **Relation Extraction (Hybrid Approach):**
-    *   If >= 2 concepts are found (from NER + Fallback):
-        *   Call `relation_extractor.extract_relations_hybrid(doc, final_concepts)`.
-        *   **Concept Filtering:** Excludes certain concepts based on CUI (`EXCLUDE_CUIS_FROM_RELATIONS`) or Semantic Type (`EXCLUDE_SEM_TYPES_FROM_RELATIONS` - currently minimal) before pairing.
-        *   **Rule-Based Attempt:** Calls `apply_dependency_rules` to check for relations based on syntactic patterns (prepositional phrases, verb mediation, adjectival modifiers, conjunctions, staging patterns) between pairs of eligible concept spans.
-        *   **KB Lookup Fallback:** If no rule matches a pair, calls `lookup_kb_relation` to query the `MRREL` table for known relationships (prioritizing NCI source, specific relation types).
-5.  **Output:** Returns a dictionary containing a list of identified `concepts` (with span info, CUI, code, types, score, source) and a list of extracted `relations` (subj/obj CUIs, relation label, source).
+1.  **API & Communication (`api/main.py`):**
+    *   `@app.websocket("/ws")`: Defines the WebSocket endpoint.
+        *   Manages connection lifecycle (accept, disconnect).
+        *   Receives JSON messages (`{'type': 'process_phrase', 'payload': '...'}`).
+        *   Uses an `asyncio.Queue` (`log_queue`) for receiving logs from the processing thread.
+        *   Spawns an `async def send_logs()` task to read from `log_queue` and send `{type: 'log', ...}` messages to the client.
+        *   Captures the main event loop (`asyncio.get_running_loop()`).
+        *   Defines `log_callback_sync(message)`: A synchronous function passed to the processing thread, uses `main_event_loop.call_soon_threadsafe` to put log messages onto `log_queue`.
+        *   Calls `process_phrase` in a separate thread using `asyncio.to_thread(process_phrase, phrase, log_func=log_callback_sync)`.
+        *   Sends the final `{type: 'result', ...}` or `{type: 'error', ...}` message upon completion or failure.
+        *   Handles cleanup of the `send_logs` task.
 
-**Folder Structure & File Descriptions:**
+2.  **Main Processing Orchestration (`scripts/process_phrase.py`):**
+    *   `process_phrase(phrase: str, log_func: Optional[Callable[[str], None]] = None)`:
+        *   Main entry point for processing a single phrase string.
+        *   Accepts an optional callback `log_func` for sending real-time logs.
+        *   Initializes spaCy NLP pipeline (`nlp(phrase)`). Calls `log_func`.
+        *   Iterates through `doc.ents` identified by spaCy NER.
+        *   Calls `get_filtered_db_matches` for each NER entity. Calls `log_func`.
+        *   Selects the best non-duplicate concept based on score and adds to `final_concepts`. Calls `log_func`.
+        *   Initiates fallback token processing. Calls `log_func`.
+        *   Iterates through spaCy tokens, skipping those overlapping with NER entities or having irrelevant POS tags.
+        *   Calls `get_filtered_db_matches` for candidate tokens.
+        *   Selects token-based concepts only if score meets `FALLBACK_SCORE_THRESHOLD` and CUI is not already present. Calls `log_func`.
+        *   If >= 2 concepts found, calls `relation_extractor.extract_relations_hybrid(doc, final_concepts)`. Calls `log_func`.
+        *   Returns the final `{'concepts': [...], 'relations': [...]}` dictionary. Calls `log_func`.
+    *   `get_filtered_db_matches(entity_text: str, entity_label: str = "UNKNOWN")`:
+        *   Takes entity text and optional NER label.
+        *   Calls `db_utils.find_concept_by_term_and_source` (exact match first, then partial) for `SAB='NCI'`.
+        *   Retrieves semantic types for candidates using `db_utils.get_semantic_types_for_cui`.
+        *   Filters candidates based on `EXCLUDE_SEMANTIC_TYPES` and matching between NER label and allowed types (`LABEL_TO_SEMANTIC_TYPES`).
+        *   Calculates a score based on exact match bonus and `rapidfuzz.fuzz.ratio`.
+        *   Sorts valid, non-duplicate matches by score (descending).
+        *   Returns sorted list of concept dictionaries (`{'cui': ..., 'matched_term': ..., 'code': ..., 'sem_types': ..., 'score': ...}`).
+    *   `overlaps(start1: int, end1: int, start2: int, end2: int)`: Simple helper to check span overlap.
+
+3.  **Relation Extraction (`scripts/relation_extractor.py`):**
+    *   `extract_relations_hybrid(doc: spacy.tokens.Doc, concepts: List[Dict])`:
+        *   Orchestrates relation extraction.
+        *   Filters input `concepts` based on CUI (`EXCLUDE_CUIS_FROM_RELATIONS`) and semantic type (`EXCLUDE_SEM_TYPES_FROM_RELATIONS`) exclusion lists.
+        *   Maps remaining concepts back to spaCy `Span` objects using `map_concepts_to_spans`.
+        *   Iterates through pairs of eligible concept spans.
+        *   For each pair, calls `apply_dependency_rules`.
+        *   If no rule matches, calls `lookup_kb_relation` as a fallback.
+        *   Returns a list of relation dictionaries (`{'subject_cui': ..., 'object_cui': ..., 'relation': ..., 'source': 'rule' | 'kb'}`).
+    *   `apply_dependency_rules(span1: Span, span2: Span, doc: Doc, concept_map: Dict)`:
+        *   Implements rule-based relation extraction using spaCy dependency parse.
+        *   Checks for syntactic patterns between the two spans:
+            *   Prepositional attachments (`prep` dependency, checking specific prepositions like 'to', 'in', 'of').
+            *   Verb-mediated relations (`verb` connecting subject/object).
+            *   Adjectival/noun modifiers (`amod`, `compound`).
+            *   Conjunctions (`conj` dependency, often indicating association).
+            *   Specific staging patterns (e.g., "Stage III", linking stage to disease).
+        *   Returns `Optional[Tuple(subj_cui, rel_label, obj_cui)]` if a rule matches.
+    *   `lookup_kb_relation(cui1: str, cui2: str)`:
+        *   Calls `db_utils.get_relations_for_cui_pair` to query the `MRREL` table for pre-existing relationships between the two CUIs.
+        *   Calls `select_best_kb_relation` to filter and rank the KB results based on source priority (e.g., NCI, SNOMEDCT_US) and relation type priority (`RELA`).
+        *   Returns `Optional[Tuple(subj_cui, rel_label, obj_cui)]` if a suitable KB relation is found.
+    *   `map_concepts_to_spans(doc: Doc, concepts: List[Dict])`: Utility to align concept dictionaries (with char offsets) to actual spaCy `Span` objects.
+    *   `select_best_kb_relation(relations: List[Dict])`: Filters/ranks MRREL results.
+    *   `_get_token_context()`: Helper used by rules (likely checks surrounding token lemmas).
+
+4.  **Database Utilities (`scripts/db_utils.py`):**
+    *   `get_db_connection()`: Establishes and returns a PostgreSQL connection using environment variables.
+    *   `find_concept_by_term_and_source(term: str, source_sab: str, exact_match: bool, case_sensitive: bool, limit: int)`: Queries `MRCONSO` table for concepts matching `term` string within a given `source_sab` (e.g., 'NCI'). Supports exact/partial and case-(in)sensitive matching using string functions and `pg_trgm` index. Returns list of tuples `(cui, str, code)`.
+    *   `get_semantic_types_for_cui(cui: str)`: Queries `MRSTY` table for semantic types associated with a given `cui`. Returns list of tuples `(tui, sty)`.
+    *   `get_relations_for_cui_pair(cui1: str, cui2: str, filter_sab: Optional[str] = None)`: Queries `MRREL` table for direct relationships between `cui1` and `cui2` (in both directions). Allows filtering by source vocabulary (`SAB`). Returns list of relation dictionaries from `MRREL`.
+
+**Frontend Application (Astro) & Key Logic:**
+
+Located in the `frontend/` directory.
+
+1.  **WebSocket Manager (`frontend/src/lib/websocket.ts`):**
+    *   `wsManager`: Exported object managing the WebSocket lifecycle.
+    *   `connect()`: Establishes WebSocket connection to `ws://localhost:8000/ws`. Handles `onopen`, `onmessage`, `onerror`, `onclose`. Implements automatic reconnection logic with `RECONNECT_DELAY`.
+    *   `disconnect()`: Manually closes the WebSocket connection.
+    *   `sendMessage(type: string, payload: any)`: Sends JSON messages (e.g., `{type: 'process_phrase', ...}`) to the backend. Updates status to 'processing'.
+    *   `onLog(callback)`, `onResult(callback)`, `onError(callback)`, `onStatusChange(callback)`: Registration methods allowing components to subscribe to incoming messages or status changes. Return unsubscribe functions.
+    *   `updateStatus(status)`: Internal helper to manage `isConnected`, `isProcessing` flags and notify status listeners. Updates the global status indicator in the layout.
+    *   `initialize()`: Called on load to initiate the first connection attempt.
+
+2.  **Input Form (`frontend/src/components/InputForm.astro`):**
+    *   Renders `<textarea>` and `<button>`.
+    *   `<script>`:
+        *   Gets element references.
+        *   `handleSubmit()`: Reads textarea value, calls `wsManager.sendMessage('process_phrase', ...)` if input is valid and not currently processing. Triggered by button click or Enter key.
+        *   Subscribes to `wsManager.onStatusChange` to update local `isProcessing` state and enable/disable the submit button accordingly.
+
+3.  **Graph Visualizer (`frontend/src/components/GraphVisualizer.astro`):**
+    *   Renders container div `#cy-container` and control buttons (zoom in/out, reset) using `<Icon>` component.
+    *   `<script>`:
+        *   `initializeOrUpdateGraph(concepts = [], relations = [])`: Core function. Initializes Cytoscape.js instance (`cyInstance`) on first call or updates existing instance. Maps `concepts` array to Cytoscape `nodes` (setting `id`, `label`, `type` based on data) and `relations` array to Cytoscape `edges` (setting `source`, `target`, `label`). Uses `cyInstance.json({ elements: ... })` for efficient updates. Calls `runLayout`. Handles container dimension checks. Adds tooltip logic on node hover (`cyInstance.on('mouseover', ...)` etc.). Sets up button `onclick` listeners *after* `cyInstance` is created (calls `cyInstance.zoom()`, `cyInstance.fit()`). Disables/enables controls.
+        *   `runLayout(instance)`: Executes the chosen Cytoscape layout (e.g., `breadthfirst`).
+        *   `setControlsDisabled(disabled)`: Enables/disables zoom/reset buttons.
+        *   `handleResize()`: Debounced window resize event handler; calls `cyInstance.resize()` and `cyInstance.fit()` to adapt the graph view.
+        *   `handleGraphDataUpdate(event)`: Custom event listener for `update-graph-data`; calls `initializeOrUpdateGraph` with data from `event.detail`.
+        *   Subscribes to `wsManager.onResult` to call `initializeOrUpdateGraph` with data received from the backend WebSocket.
+        *   Listens for `update-graph-data` event dispatched from JsonEditor.
+        *   Adds `resize` event listener to `window`.
+        *   Calls `initializeOrUpdateGraph()` initially (via `setTimeout`) to setup empty graph.
+
+4.  **Log Console (`frontend/src/components/LogConsole.astro`):**
+    *   Renders header with title, controls (font size +/-, clear) using `<Icon>`, and `<pre id="log-output">` for logs.
+    *   `<script>`:
+        *   `addLogMessage(message)`: Appends formatted log message (with timestamp) to `#log-output.textContent`. Handles auto-scrolling if user is near the bottom. Clears initial "Connecting..." message.
+        *   `updateFontSize(newSize)`: Updates the `font-size` style of `#log-output`, clamping values between `MIN/MAX_FONT_SIZE`. Disables +/- buttons at limits.
+        *   Button `onclick` listeners call `updateFontSize` or clear `logOutput.textContent`.
+        *   Subscribes to `wsManager.onLog` and `wsManager.onError` to call `addLogMessage`.
+        *   Subscribes to `wsManager.onStatusChange` to log connection status changes.
+        *   Initializes default font size. Handles scroll event to track `isScrolledToBottom`.
+
+5.  **JSON Editor (`frontend/src/components/JsonEditor.astro`):**
+    *   Renders header with title, controls (font size +/-, format, update graph) using `<Icon>`, and `<div id="json-editor-container">`.
+    *   `<script>`:
+        *   `initializeEditor()`: Creates CodeMirror 6 `EditorView` instance (`editorView`) attached to `#json-editor-container`. Configures `EditorState` with `basicSetup`, `json()` language support, `jsonParseLinter`, `lintGutter`, and line wrapping. Sets initial content. Calls `updateEditorFontSize`. Adds button listeners. Subscribes to WebSocket manager.
+        *   `updateEditorContent(content)`: Updates the CodeMirror document with new content (stringifies objects with formatting).
+        *   `formatJsonContent()`: Gets current editor content, tries `JSON.parse`, and if successful, calls `updateEditorContent` with the parsed object (which gets re-stringified nicely). Shows alert on parse error.
+        *   `updateEditorFontSize(newSize)`: Updates font size style on the `.cm-editor` element, clamping values. Disables +/- buttons at limits.
+        *   `handleUpdateGraphClick()`: Parses current editor JSON. Validates basic structure (`concepts`, `relations` arrays). Dispatches `CustomEvent('update-graph-data', { detail: parsedData })` on `document.body`. Shows alert on success/failure.
+        *   Button `onclick` listeners call `updateEditorFontSize`, `formatJsonContent`, or `handleUpdateGraphClick`.
+        *   Subscribes to `wsManager.onResult` to call `updateEditorContent` with new data from the backend.
+
+**Folder Structure & File Descriptions (Summary):**
 
 ```
 .
+├── api/
+│   └── main.py            # Backend: FastAPI application, WebSocket endpoint logic.
 ├── data/
-│   └── source/
-│       └── umls/
-│           └── META/      # UMLS RRF files (MRCONSO, MRSTY, MRREL) (mounted r/o to app)
+│   └── source/umls/META/  # Backend: UMLS RRF files (mounted r/o to app)
 ├── db_setup/
-│   └── load_umls_to_pgsql.py # Python script to create tables and load UMLS subset (MRCONSO, MRSTY, MRREL) into PostgreSQL.
+│   └── load_umls_to_pgsql.py # Backend: Script to load UMLS subset to PostgreSQL.
+├── frontend/              # Frontend: Astro application
+│   ├── public/            # Frontend: Static assets (e.g., favicon)
+│   ├── src/
+│   │   ├── components/    # Frontend: Astro components (InputForm, GraphVisualizer, etc.)
+│   │   ├── layouts/       # Frontend: Astro layout component (MainLayout.astro)
+│   │   ├── lib/           # Frontend: Client-side libraries (websocket.ts)
+│   │   ├── pages/         # Frontend: Astro pages (index.astro)
+│   │   └── styles/        # Frontend: CSS styles (global.css)
+│   ├── astro.config.mjs   # Frontend: Astro configuration (integrations: astro-icon)
+│   ├── package.json       # Frontend: Node.js dependencies
+│   └── tsconfig.json      # Frontend: TypeScript configuration
 ├── scripts/
-│   ├── db_utils.py       # Database interaction functions.
-│   │   ├── get_db_connection(): Establishes PostgreSQL connection using env vars.
-│   │   ├── find_concept_by_term_and_source(): Queries MRCONSO for concepts matching a term string, filtering by SAB, supporting exact/partial, case-insensitive matching. Returns List[Tuple(cui, str, code)].
-│   │   ├── get_semantic_types_for_cui(): Queries MRSTY for semantic types (TUI, STY) for a given CUI. Returns List[Tuple(tui, sty)].
-│   │   └── get_relations_for_cui_pair(): Queries MRREL for relationships between two CUIs (both directions), allows filtering by SAB. Returns List[Dict].
-│   ├── process_phrase.py # Core pipeline orchestration script.
-│   │   ├── get_filtered_db_matches(): Finds, filters (by label/sem_type, exclusions), and ranks (exact match, fuzzy score) potential concept matches for a given text span. Returns sorted List[Dict].
-│   │   ├── overlaps(): Helper to check if two character spans overlap.
-│   │   └── process_phrase(): Main function taking a phrase string. Performs SpaCy NLP, NER concept extraction, fallback token concept detection, calls relation extraction, and returns final {'concepts': [...], 'relations': [...]}.
-│   ├── relation_extractor.py # Implements relation extraction logic.
-│   │   ├── map_concepts_to_spans(): Maps concept dictionaries (with offsets) back to SpaCy Span objects.
-│   │   ├── _get_token_context(): Helper to get lemmas of surrounding tokens.
-│   │   ├── apply_dependency_rules(): Implements rule-based RE using SpaCy dependency parse. Checks for prepositional attachments, verb mediations, modifiers, conjunctions, staging patterns. Returns Optional[Tuple(subj_cui, rel, obj_cui)].
-│   │   ├── select_best_kb_relation(): Filters and ranks relations found in MRREL based on SAB/RELA priority.
-│   │   ├── lookup_kb_relation(): Calls get_relations_for_cui_pair and select_best_kb_relation.
-│   │   └── extract_relations_hybrid(): Orchestrates RE. Filters concepts, calls apply_dependency_rules, calls lookup_kb_relation if no rule matches. Returns List[Dict].
-│   ├── align_annotations.py # (Inactive - Evaluation) Potential script for evaluation against gold standard.
-│   ├── parse_raw.py         # (Inactive - Preprocessing) Potential script for initial data parsing.
-│   └── process_text.py      # (Inactive - Old/Cleaning) Likely superseded.
-├── templates/             # (Placeholder for Web App HTML)
-├── static/                # (Placeholder for Web App CSS/JS)
+│   ├── db_utils.py       # Backend: Database interaction functions.
+│   ├── process_phrase.py # Backend: Core NLP/Concept/Relation pipeline logic.
+│   ├── relation_extractor.py # Backend: Rule-based & KB relation extraction logic.
 ├── .dockerignore
+├── .env.example           # Backend: Example environment variables
 ├── .gitignore
-├── docker-compose.yml   # Defines services (db, app), network, volume, environment variables, ports.
-├── Dockerfile             # Builds the Python 'app' service image, installs dependencies, copies code.
-├── entrypoint.sh          # Container startup script: Waits for DB, checks if DB populated (via flag/query), checks RRF files, runs loader script if needed, executes main CMD.
-└── requirements.txt       # Lists Python dependencies (psycopg2, spacy, scispacy, model URL, rapidfuzz).
+├── docker-compose.yml   # Defines backend services (db, app). Runs FastAPI app.
+├── Dockerfile             # Builds the backend Python 'app' service image.
+├── entrypoint.sh          # Backend: Container startup script.
+└── requirements.txt       # Backend: Python dependencies.
 ```
 
 **Current Status & Achievements:**
 
-*   Stable Docker environment with persistent PostgreSQL DB.
-*   UMLS subset (MRCONSO, MRSTY, MRREL including NCIt) successfully loaded and queryable.
-*   Robust entrypoint script handles DB readiness and prevents data reloads.
-*   Concept Identification pipeline implemented:
-    *   Integrates ScispaCy NER (`en_ner_bc5cdr_md`).
-    *   Uses efficient DB lookups (exact match first).
-    *   Applies semantic type filtering (label-based and exclusion list).
-    *   Ranks concepts effectively using `rapidfuzz` similarity scoring.
-    *   **Includes a token-based fallback mechanism that successfully identifies key concepts missed by NER.**
-*   Hybrid Relation Extraction pipeline implemented:
-    *   Filters concepts before pairing to reduce noise.
-    *   Attempts rule-based extraction using dependency parses.
-    *   Attempts KB lookup via `MRREL` as a fallback.
-    *   **Successfully extracts *some* relations via rules (staging, modifiers, PART_OF).**
+*   Stable Docker environment for backend (PostgreSQL DB + FastAPI App).
+*   UMLS subset (MRCONSO, MRSTY, MRREL including NCIt) loaded and queryable.
+*   Backend concept/relation extraction pipeline functional via WebSocket API with real-time logging.
+*   **Fully functional Astro frontend application:**
+    *   Real-time WebSocket communication implemented.
+    *   Interactive components for input, logs, graph visualization, JSON output viewing/editing.
+    *   UI controls operational (zoom, font size, format, clear, update graph).
+    *   Graph updates from both WebSocket results and edited JSON.
+    *   Responsive layout with appropriate component scrolling.
 
 **Known Issues / Challenges:**
 
-1.  **Relation Rule Deficiencies:** The primary bottleneck. The current dependency-based rules in `relation_extractor.py` fail to correctly identify several common and important relations:
-    *   **Prepositional phrases:** Rules for `to`, `in`, `of` (indicating location, metastasis, history) are not reliably matching the parse structures.
-    *   **Conjunctions:** The rule for `and` (indicating association or treatment combinations) is not reliably firing.
-    *   **Verb phrases:** Logic for verbs like `include` doesn't capture all related concepts (e.g., second object in a conjunction).
-2.  **KB Lookup Limitations:** The `MRREL` lookups (even when restored) did not find explicit relations for many clinically relevant pairs within the prioritized sources (NCI, SNOMEDCT_US), highlighting the need for better rule-based interpretation.
-3.  **Multi-Token Fallback:** The current token-based fallback doesn't handle multi-word terms missed by NER (e.g., "Stage III").
-4.  **Negation/Context:** The pipeline does not currently handle negation (e.g., "Negative for fever") or other complex linguistic contexts.
+1.  **Relation Rule Deficiencies:** Backend rules need refinement.
+2.  **Multi-Token Fallback:** Backend needs enhancement.
+3.  **Negation/Context:** Backend lacks handling.
+4.  **Frontend Error Handling:** Client-side error display could be improved.
+5.  **Frontend Cleanup:** Event listeners added in components are not explicitly removed on unload (minor issue in Astro's standard component model).
 
 **Next Milestones / Immediate Focus:**
 
-1.  **Web Application Implementation:**
-    *   **Backend API:** Develop a simple web server (e.g., using Flask or FastAPI) within the `app` container.
-        *   Create an endpoint (e.g., `/process`) that accepts a phrase string.
-        *   Calls the `process_phrase` function.
-        *   Returns the resulting dictionary (`{'concepts': [...], 'relations': [...]}`) as JSON.
-    *   **Frontend Visualization:** Create basic HTML/CSS/JavaScript files (in `templates`/`static`).
-        *   Fetch results from the backend API.
-        *   Use a JavaScript graph visualization library (e.g., Vis.js, Cytoscape.js, D3.js) to render the concepts as nodes and relations as edges.
-        *   Make the graph interactive (e.g., display concept details on node click).
-2.  **Defer Further RE Refinement:** Temporarily pause intensive debugging/refinement of the relation extraction rules (`relation_extractor.py`) until the basic web UI is functional. Acknowledge current RE limitations.
+1.  **Containerize Frontend:**
+    *   Modify `Dockerfile` or create a multi-stage build process.
+    *   Install Node.js, run `npm install` and `npm run build` for Astro frontend.
+    *   Configure a web server (FastAPI or Nginx) to serve static frontend files (`frontend/dist/`) from within Docker.
+2.  **Refine Relation Extraction:** Address backend rule limitations.
+3.  **Thesis Writing & Documentation:** Document the full system.
 
 --- END OF FILE context.txt ---
+```
