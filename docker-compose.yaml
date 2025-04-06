@@ -40,6 +40,7 @@ services:
       # --- RE-ADD Mount local code for backend development & hot-reloading ---
       - ./api:/app/api:rw
       - ./scripts:/app/scripts:rw
+      - ./pipelines:/app/pipelines:rw
       # Note: If you modify requirements.txt, you WILL need to rebuild the image.
       # Note: Ensure entrypoint.sh is copied via Dockerfile, not mounted, unless intended.
     networks:
@@ -52,7 +53,7 @@ services:
     #   - "8000:8000" # No longer expose backend directly to host (Nginx will proxy)
     # --- RE-ADD --reload for development ---
     # Make sure uvicorn is installed with [standard] in requirements.txt for watchfiles
-    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/api --reload-dir /app/scripts
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/api --reload-dir /app/scripts --reload-dir /app/pipelines
     restart: unless-stopped
 
   frontend: # New Frontend Nginx service
