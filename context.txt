@@ -1,211 +1,157 @@
 ```
 --- START OF FILE context.txt ---
 
-**Project Goal:** Develop an AI pipeline for a thesis that takes short oncology patient phrases as input and outputs a list of **NCI Thesaurus (NCIt)** concepts and the detailed relationships between them. The project includes a **web application** for interactive input, visualization as a knowledge graph, viewing processing logs, and examining/editing the raw JSON output. (Radiation Oncology Ontology (ROO) integration is deferred).
+**Project Goal:** Develop an AI pipeline for a thesis that takes short oncology patient phrases as input and outputs a list of **NCI Thesaurus (NCIt)** concepts and the detailed relationships between them. The project includes a **web application** for interactive input, visualization as a knowledge graph, viewing processing logs, and examining/editing the raw JSON output.
 
-**Environment & Data Setup:**
+**Environment & System Architecture:**
 
-1.  **Backend Environment:** Dockerized using Docker Compose (`docker-compose.yml`).
-    *   `db`: PostgreSQL 15 (`umls_postgres_db`), using persistent data storage via Docker volume (`postgres_data`). Healthcheck enabled. Port 5432 mapped to host 5433 for external tools.
-    *   `app`: Python 3.10 (`umls_processor_app`) image built via `Dockerfile`. Runs FastAPI backend API via Uvicorn on port 8000 (mapped to host 8000). Provides WebSocket endpoint (`/ws`) for communication. Runs as non-root user `appuser`.
-2.  **Frontend Development Environment (Current):**
-    *   Node.js LTS environment on the host machine.
-    *   Astro framework (`frontend/` directory).
-    *   Uses `npm run dev` for local development server (typically on port 4321).
-    *   Connects to the backend API running in Docker via `ws://localhost:8000/ws`.
-3.  **Data Handling & Status:**
-    *   **UMLS Subset:** Successfully loaded into the persistent PostgreSQL `db` service. Contains `MRCONSO`, `MRSTY`, `MRREL` from UMLS, including **NCI Thesaurus (SAB='NCI')**. Data persists across restarts. `pg_trgm` extension enabled.
-    *   **Database Connection:** `psycopg2-binary` used for DB connection from `app`. Connection details via environment variables.
-    *   **Source Data Mount:** Host UMLS RRF source (`./data/source/umls/META`) mounted read-only into `app` at `/app/data/source/umls/META`.
+1.  **Dockerized Environment:** Fully containerized using Docker Compose (`docker-compose.yml`). Runs via `docker compose up -d` after `docker compose build`.
+    *   `db`: PostgreSQL 15 (`umls_postgres_db`), using persistent data storage via Docker volume (`postgres_data`). Healthcheck enabled. Port 5432 mapped to host 5433 for external tools. Runs on internal `umls_net` network.
+    *   `app`: Backend Python 3.10 (`umls_processor_app`) image built via root `Dockerfile`. Runs FastAPI API via Uvicorn on port 8000 (internal to Docker). Provides WebSocket endpoint (`/ws`) for real-time communication. Uses volume mounts (`./api:/app/api`, `./scripts:/app/scripts`, `./pipelines:/app/pipelines`) for backend code hot-reloading during development (`--reload --reload-dir ...` enabled in `command`). Runs as non-root user `appuser`. Runs on `umls_net` network. Connects to `db` service. Responsible for running the selected AI processing pipeline.
+    *   `frontend`: Nginx (`umls_frontend_nginx`) image built via `frontend/Dockerfile`. Serves the static Astro frontend assets (built during the image build process using `npm run build`) on internal port 80. Maps host port **8080** to container port 80 for external access (`http://localhost:8080`). Uses `frontend/nginx.conf` to configure serving static files (with `try_files` for SPA fallback to `index.html`) and to **proxy** WebSocket requests (`location /ws { proxy_pass http://app:8000/ws; ... }`) to the `app` service. Runs on `umls_net` network. Depends on `app`.
 
-**Core Backend Pipeline Strategy & Key Functions:**
+2.  **Data Handling & Status:**
+    *   **UMLS Subset:** Successfully loaded into the persistent PostgreSQL `db` service. Contains `MRCONSO`, `MRSTY`, `MRREL` tables from UMLS, specifically including **NCI Thesaurus (SAB='NCI')**. Data persists across container restarts. `pg_trgm` extension is enabled in the database for efficient partial string matching.
+    *   **Database Connection:** `psycopg2-binary` library used in the `app` service for DB connection. Connection details (host, port, dbname, user, password) are passed via environment variables, with `DB_HOST=db` targeting the database service on the Docker network.
+    *   **Source Data Mount:** Host UMLS RRF source files (`./data/source/umls/META`) are mounted read-only into the `app` container at `/app/data/source/umls/META`. This is currently *not* used by the pipeline but available if needed later.
 
-Implemented primarily across `api/main.py`, `scripts/process_phrase.py`, `scripts/relation_extractor.py`, and `scripts/db_utils.py`.
+**Core Backend Pipeline Architecture (Modular):**
 
-1.  **API & Communication (`api/main.py`):**
-    *   `@app.websocket("/ws")`: Defines the WebSocket endpoint.
-        *   Manages connection lifecycle (accept, disconnect).
-        *   Receives JSON messages (`{'type': 'process_phrase', 'payload': '...'}`).
+The backend processing logic is designed to be modular and swappable, centered around an Abstract Base Class defining a common interface. This allows different AI model implementations to be tested.
+
+1.  **Pipeline Interface (`pipelines/base_pipeline.py`):**
+    *   Defines the `BaseProcessingPipeline(ABC)` abstract class.
+    *   Requires all concrete pipeline implementations to implement the `process` method signature:
+        *   `process(self, phrase: str, log_func: Optional[Callable[[str], None]] = None) -> Dict[str, List[Dict[str, Any]]]`
+        *   **Input:**
+            *   `phrase`: The user's input text phrase (string).
+            *   `log_func`: An optional callback function provided by the API layer. Pipelines should call this function with string messages to report progress or steps in real-time. This function handles thread-safe asynchronous communication back to the API (e.g., for WebSocket streaming).
+        *   **Output:** Must return a dictionary containing exactly two keys:
+            *   `'concepts'`: A list of concept dictionaries. Standardized format expected: `{'cui': str, 'matched_term': str, 'text_span': str, 'start_char': int, 'end_char': int, 'sem_types': List[str], 'score': float, 'source': str}` (e.g., source='ner', 'fallback_token'). List should ideally be sorted by `start_char`.
+            *   `'relations'`: A list of relation dictionaries. Standardized format expected: `{'subject_cui': str, 'object_cui': str, 'relation': str, 'source': str, 'subj_text': str, 'obj_text': str}` (e.g., source='rule-based', 'kb-lookup (NCI)').
+
+2.  **Current Implementation (`pipelines/spacy_rule_based/`):**
+    *   The primary implementation is `SpacyRuleBasedPipeline(BaseProcessingPipeline)` located in `pipelines/spacy_rule_based/processor.py`.
+    *   **Initialization (`__init__`)**: Loads the configured ScispaCy model (`en_ner_bc5cdr_md` by default via `spacy.load()`) into `self.nlp`. Logs success or critical failure if the model cannot be loaded. Stores configuration (like `TARGET_SOURCE='NCI'`, `FALLBACK_SCORE_THRESHOLD`, `LABEL_TO_SEMANTIC_TYPES`) as class or instance attributes.
+    *   **`process` Method Implementation:** Orchestrates the steps:
+        *   Takes `phrase` and `log_func`. Uses an internal `_log` helper to route messages to `log_func` and the backend `self.logger`.
+        *   Runs NLP pipeline: `doc = self.nlp(phrase)`. This performs tokenization, POS tagging, dependency parsing, and NER.
+        *   **NER Concept Extraction:** Iterates through `doc.ents` (entities identified by ScispaCy NER). For each entity:
+            *   Calls `self._get_filtered_db_matches(entity_text, entity_label)`. This helper queries the DB (using shared `scripts.db_utils.find_concept_by_term_and_source` for exact then partial NCI matches), retrieves semantic types (`scripts.db_utils.get_semantic_types_for_cui`), filters results based on `EXCLUDE_SEMANTIC_TYPES` and `LABEL_TO_SEMANTIC_TYPES` mappings, calculates a score (`rapidfuzz.fuzz.ratio` + exact match bonus), and returns ranked matches.
+            *   Selects the best-scoring match if its CUI hasn't been added yet, logs it, and appends to `final_concepts`. Stores the span (`start_char`, `end_char`) to avoid overlap in fallback.
+        *   **Fallback Concept Extraction:** Iterates through individual spaCy `Tokens` in the `doc`. Skips tokens overlapping with already processed NER entity spans or those with irrelevant POS tags (e.g., not in `NOUN`, `PROPN`, `ADJ`).
+            *   Calls `self._get_filtered_db_matches(token_text, "UNKNOWN")` for promising tokens.
+            *   Selects the best match only if its score meets a strict `FALLBACK_SCORE_THRESHOLD` (currently requires exact match bonus) and the CUI hasn't been added. Logs it and appends to `final_concepts`.
+        *   **Relation Extraction Call:** If 2 or more concepts are found and the spaCy `parser` component loaded correctly:
+            *   Calls `extract_relations_hybrid(doc, final_concepts, log_func)` from the sibling module `pipelines.spacy_rule_based.relation_extractor`.
+        *   Returns the final `{'concepts': final_concepts, 'relations': extracted_relations}` dictionary (concepts sorted by start char).
+    *   **Relation Extraction Logic (`pipelines/spacy_rule_based/relation_extractor.py`):**
+        *   Contains `extract_relations_hybrid(doc, concepts, log_func)`.
+        *   Uses helper `map_concepts_to_spans` to align concept dicts (with char offsets) to spaCy `Span` objects.
+        *   Filters concepts based on CUI (`EXCLUDE_CUIS_FROM_RELATIONS`) exclusion list.
+        *   Iterates through pairs (`itertools.combinations`) of eligible concept spans.
+        *   For each pair, calls `apply_dependency_rules(span1, span2, concept_details, log_func)`. This function implements rule-based logic using spaCy dependency parse trees (`token.dep_`, `token.head`). Checks patterns like prepositional attachments (`pobj` of `prep`, using `PREPOSITION_MAP`), verb-mediated relations (`nsubj`, `dobj` connected by known verbs in `VERB_MAP`), adjectival modifiers (`amod`), and conjunctions (`conj`). Logs rule matches via `log_func`.
+        *   If no rule matches, calls `lookup_kb_relation(cui1, cui2, log_func)` as a fallback. This queries the `MRREL` table via `scripts.db_utils.get_relations_for_cui_pair` for pre-existing UMLS relationships. It then calls `select_best_kb_relation` to filter/rank results based on source (`KB_SAB_PRIORITY`) and relation type (`KB_RELA_PRIORITY`, `KB_REL_IGNORE`). Logs KB lookup results via `log_func`.
+        *   Returns the final list of relation dictionaries, including `source` ('rule-based' or 'kb-lookup (SAB)').
+
+3.  **API Integration (`api/main.py`):**
+    *   Imports `BaseProcessingPipeline` and specific implementations (e.g., `SpacyRuleBasedPipeline`).
+    *   **Instantiates** the desired pipeline class on startup (currently hardcoded to `SpacyRuleBasedPipeline`, intended to be configurable via `PROCESSING_PIPELINE` env var). Stores the singleton instance in the global `processing_pipeline` variable. Includes logging and error handling for initialization failures (checks if `nlp` model loaded for SpaCy pipeline).
+    *   The WebSocket endpoint (`@app.websocket("/ws")`) checks if `processing_pipeline` is not `None` before accepting connections.
+    *   When a `{'type': 'process_phrase', 'payload': '...'}` message is received, the API endpoint:
+        *   Manages connection lifecycle and cleanup of previous tasks.
         *   Uses an `asyncio.Queue` (`log_queue`) for receiving logs from the processing thread.
         *   Spawns an `async def send_logs()` task to read from `log_queue` and send `{type: 'log', ...}` messages to the client.
-        *   Captures the main event loop (`asyncio.get_running_loop()`).
-        *   Defines `log_callback_sync(message)`: A synchronous function passed to the processing thread, uses `main_event_loop.call_soon_threadsafe` to put log messages onto `log_queue`.
-        *   Calls `process_phrase` in a separate thread using `asyncio.to_thread(process_phrase, phrase, log_func=log_callback_sync)`.
-        *   Sends the final `{type: 'result', ...}` or `{type: 'error', ...}` message upon completion or failure.
-        *   Handles cleanup of the `send_logs` task.
+        *   Defines `log_callback_sync(message)`: A synchronous function passed to the pipeline, uses `main_event_loop.call_soon_threadsafe` to put log messages onto `log_queue`.
+        *   Calls the core processing in a separate thread to avoid blocking the async loop: `await asyncio.to_thread(processing_pipeline.process, phrase, log_func=log_callback_sync)`. **Crucially, it calls the `process` method of the instantiated `processing_pipeline` object.**
+        *   Sends the final `{type: 'result', ...}` or `{type: 'error', ...}` message upon completion or failure. Handles task cancellation and cleanup.
 
-2.  **Main Processing Orchestration (`scripts/process_phrase.py`):**
-    *   `process_phrase(phrase: str, log_func: Optional[Callable[[str], None]] = None)`:
-        *   Main entry point for processing a single phrase string.
-        *   Accepts an optional callback `log_func` for sending real-time logs.
-        *   Initializes spaCy NLP pipeline (`nlp(phrase)`). Calls `log_func`.
-        *   Iterates through `doc.ents` identified by spaCy NER.
-        *   Calls `get_filtered_db_matches` for each NER entity. Calls `log_func`.
-        *   Selects the best non-duplicate concept based on score and adds to `final_concepts`. Calls `log_func`.
-        *   Initiates fallback token processing. Calls `log_func`.
-        *   Iterates through spaCy tokens, skipping those overlapping with NER entities or having irrelevant POS tags.
-        *   Calls `get_filtered_db_matches` for candidate tokens.
-        *   Selects token-based concepts only if score meets `FALLBACK_SCORE_THRESHOLD` and CUI is not already present. Calls `log_func`.
-        *   If >= 2 concepts found, calls `relation_extractor.extract_relations_hybrid(doc, final_concepts)`. Calls `log_func`.
-        *   Returns the final `{'concepts': [...], 'relations': [...]}` dictionary. Calls `log_func`.
-    *   `get_filtered_db_matches(entity_text: str, entity_label: str = "UNKNOWN")`:
-        *   Takes entity text and optional NER label.
-        *   Calls `db_utils.find_concept_by_term_and_source` (exact match first, then partial) for `SAB='NCI'`.
-        *   Retrieves semantic types for candidates using `db_utils.get_semantic_types_for_cui`.
-        *   Filters candidates based on `EXCLUDE_SEMANTIC_TYPES` and matching between NER label and allowed types (`LABEL_TO_SEMANTIC_TYPES`).
-        *   Calculates a score based on exact match bonus and `rapidfuzz.fuzz.ratio`.
-        *   Sorts valid, non-duplicate matches by score (descending).
-        *   Returns sorted list of concept dictionaries (`{'cui': ..., 'matched_term': ..., 'code': ..., 'sem_types': ..., 'score': ...}`).
-    *   `overlaps(start1: int, end1: int, start2: int, end2: int)`: Simple helper to check span overlap.
-
-3.  **Relation Extraction (`scripts/relation_extractor.py`):**
-    *   `extract_relations_hybrid(doc: spacy.tokens.Doc, concepts: List[Dict])`:
-        *   Orchestrates relation extraction.
-        *   Filters input `concepts` based on CUI (`EXCLUDE_CUIS_FROM_RELATIONS`) and semantic type (`EXCLUDE_SEM_TYPES_FROM_RELATIONS`) exclusion lists.
-        *   Maps remaining concepts back to spaCy `Span` objects using `map_concepts_to_spans`.
-        *   Iterates through pairs of eligible concept spans.
-        *   For each pair, calls `apply_dependency_rules`.
-        *   If no rule matches, calls `lookup_kb_relation` as a fallback.
-        *   Returns a list of relation dictionaries (`{'subject_cui': ..., 'object_cui': ..., 'relation': ..., 'source': 'rule' | 'kb'}`).
-    *   `apply_dependency_rules(span1: Span, span2: Span, doc: Doc, concept_map: Dict)`:
-        *   Implements rule-based relation extraction using spaCy dependency parse.
-        *   Checks for syntactic patterns between the two spans:
-            *   Prepositional attachments (`prep` dependency, checking specific prepositions like 'to', 'in', 'of').
-            *   Verb-mediated relations (`verb` connecting subject/object).
-            *   Adjectival/noun modifiers (`amod`, `compound`).
-            *   Conjunctions (`conj` dependency, often indicating association).
-            *   Specific staging patterns (e.g., "Stage III", linking stage to disease).
-        *   Returns `Optional[Tuple(subj_cui, rel_label, obj_cui)]` if a rule matches.
-    *   `lookup_kb_relation(cui1: str, cui2: str)`:
-        *   Calls `db_utils.get_relations_for_cui_pair` to query the `MRREL` table for pre-existing relationships between the two CUIs.
-        *   Calls `select_best_kb_relation` to filter and rank the KB results based on source priority (e.g., NCI, SNOMEDCT_US) and relation type priority (`RELA`).
-        *   Returns `Optional[Tuple(subj_cui, rel_label, obj_cui)]` if a suitable KB relation is found.
-    *   `map_concepts_to_spans(doc: Doc, concepts: List[Dict])`: Utility to align concept dictionaries (with char offsets) to actual spaCy `Span` objects.
-    *   `select_best_kb_relation(relations: List[Dict])`: Filters/ranks MRREL results.
-    *   `_get_token_context()`: Helper used by rules (likely checks surrounding token lemmas).
-
-4.  **Database Utilities (`scripts/db_utils.py`):**
-    *   `get_db_connection()`: Establishes and returns a PostgreSQL connection using environment variables.
-    *   `find_concept_by_term_and_source(term: str, source_sab: str, exact_match: bool, case_sensitive: bool, limit: int)`: Queries `MRCONSO` table for concepts matching `term` string within a given `source_sab` (e.g., 'NCI'). Supports exact/partial and case-(in)sensitive matching using string functions and `pg_trgm` index. Returns list of tuples `(cui, str, code)`.
-    *   `get_semantic_types_for_cui(cui: str)`: Queries `MRSTY` table for semantic types associated with a given `cui`. Returns list of tuples `(tui, sty)`.
-    *   `get_relations_for_cui_pair(cui1: str, cui2: str, filter_sab: Optional[str] = None)`: Queries `MRREL` table for direct relationships between `cui1` and `cui2` (in both directions). Allows filtering by source vocabulary (`SAB`). Returns list of relation dictionaries from `MRREL`.
+4.  **Shared Utilities (`scripts/`):**
+    *   Common functions intended to be reusable across different potential pipeline implementations.
+    *   `scripts/db_utils.py`: Contains functions for interacting with the UMLS PostgreSQL database (`get_db_connection`, `find_concept_by_term_and_source`, `get_semantic_types_for_cui`, `get_relations_for_cui_pair`). These are essential for mapping text to concepts and looking up existing relations.
 
 **Frontend Application (Astro) & Key Logic:**
 
-Located in the `frontend/` directory.
+Located in the `frontend/` directory. Built into static assets (`frontend/dist/`) during Docker image creation and served by the `frontend` Nginx container.
 
 1.  **WebSocket Manager (`frontend/src/lib/websocket.ts`):**
-    *   `wsManager`: Exported object managing the WebSocket lifecycle.
-    *   `connect()`: Establishes WebSocket connection to `ws://localhost:8000/ws`. Handles `onopen`, `onmessage`, `onerror`, `onclose`. Implements automatic reconnection logic with `RECONNECT_DELAY`.
+    *   Exports `wsManager` object to handle WebSocket communication.
+    *   `connect()`: Establishes WebSocket connection to the Nginx proxy using a **relative URL** (`ws://${window.location.host}/ws`). Handles `onopen`, `onmessage`, `onerror`, `onclose`. Implements automatic reconnection logic with `RECONNECT_DELAY`.
     *   `disconnect()`: Manually closes the WebSocket connection.
-    *   `sendMessage(type: string, payload: any)`: Sends JSON messages (e.g., `{type: 'process_phrase', ...}`) to the backend. Updates status to 'processing'.
-    *   `onLog(callback)`, `onResult(callback)`, `onError(callback)`, `onStatusChange(callback)`: Registration methods allowing components to subscribe to incoming messages or status changes. Return unsubscribe functions.
-    *   `updateStatus(status)`: Internal helper to manage `isConnected`, `isProcessing` flags and notify status listeners. Updates the global status indicator in the layout.
-    *   `initialize()`: Called on load to initiate the first connection attempt.
+    *   `sendMessage(type: string, payload: any)`: Sends JSON messages (e.g., `{type: 'process_phrase', ...}`) to the backend via Nginx. Updates internal status to 'processing'.
+    *   `onLog(callback)`, `onResult(callback)`, `onError(callback)`, `onStatusChange(callback)`: Registration methods allowing components to subscribe to incoming messages or status changes (e.g., 'connected', 'disconnected', 'processing', 'error'). Return unsubscribe functions.
+    *   Manages internal state (`isConnected`, `isProcessing`) and notifies listeners. Updates a global status indicator (`#connection-status`) in the layout.
 
 2.  **Input Form (`frontend/src/components/InputForm.astro`):**
-    *   Renders `<textarea>` and `<button>`.
-    *   `<script>`:
-        *   Gets element references.
-        *   `handleSubmit()`: Reads textarea value, calls `wsManager.sendMessage('process_phrase', ...)` if input is valid and not currently processing. Triggered by button click or Enter key.
-        *   Subscribes to `wsManager.onStatusChange` to update local `isProcessing` state and enable/disable the submit button accordingly.
-
+    *   Renders `<textarea>` and `<button>`. Client-side script handles form submission (button click or Enter), calls `wsManager.sendMessage('process_phrase', ...)` if connected and not already processing. Disables button while processing based on `wsManager.onStatusChange`.
 3.  **Graph Visualizer (`frontend/src/components/GraphVisualizer.astro`):**
-    *   Renders container div `#cy-container` and control buttons (zoom in/out, reset) using `<Icon>` component.
-    *   `<script>`:
-        *   `initializeOrUpdateGraph(concepts = [], relations = [])`: Core function. Initializes Cytoscape.js instance (`cyInstance`) on first call or updates existing instance. Maps `concepts` array to Cytoscape `nodes` (setting `id`, `label`, `type` based on data) and `relations` array to Cytoscape `edges` (setting `source`, `target`, `label`). Uses `cyInstance.json({ elements: ... })` for efficient updates. Calls `runLayout`. Handles container dimension checks. Adds tooltip logic on node hover (`cyInstance.on('mouseover', ...)` etc.). Sets up button `onclick` listeners *after* `cyInstance` is created (calls `cyInstance.zoom()`, `cyInstance.fit()`). Disables/enables controls.
-        *   `runLayout(instance)`: Executes the chosen Cytoscape layout (e.g., `breadthfirst`).
-        *   `setControlsDisabled(disabled)`: Enables/disables zoom/reset buttons.
-        *   `handleResize()`: Debounced window resize event handler; calls `cyInstance.resize()` and `cyInstance.fit()` to adapt the graph view.
-        *   `handleGraphDataUpdate(event)`: Custom event listener for `update-graph-data`; calls `initializeOrUpdateGraph` with data from `event.detail`.
-        *   Subscribes to `wsManager.onResult` to call `initializeOrUpdateGraph` with data received from the backend WebSocket.
-        *   Listens for `update-graph-data` event dispatched from JsonEditor.
-        *   Adds `resize` event listener to `window`.
-        *   Calls `initializeOrUpdateGraph()` initially (via `setTimeout`) to setup empty graph.
-
+    *   Uses Cytoscape.js library. Renders graph in `#cy-container`. Client-side script initializes or updates the graph (`cyInstance`) based on data received via `wsManager.onResult`. Maps `concepts` to nodes and `relations` to edges. Also listens for `update-graph-data` custom event (dispatched by JsonEditor) to update graph from edited data. Includes UI controls (`<Icon>`) for zoom in/out/reset, which call `cyInstance` methods. Handles window resizing. Displays tooltips on node hover.
 4.  **Log Console (`frontend/src/components/LogConsole.astro`):**
-    *   Renders header with title, controls (font size +/-, clear) using `<Icon>`, and `<pre id="log-output">` for logs.
-    *   `<script>`:
-        *   `addLogMessage(message)`: Appends formatted log message (with timestamp) to `#log-output.textContent`. Handles auto-scrolling if user is near the bottom. Clears initial "Connecting..." message.
-        *   `updateFontSize(newSize)`: Updates the `font-size` style of `#log-output`, clamping values between `MIN/MAX_FONT_SIZE`. Disables +/- buttons at limits.
-        *   Button `onclick` listeners call `updateFontSize` or clear `logOutput.textContent`.
-        *   Subscribes to `wsManager.onLog` and `wsManager.onError` to call `addLogMessage`.
-        *   Subscribes to `wsManager.onStatusChange` to log connection status changes.
-        *   Initializes default font size. Handles scroll event to track `isScrolledToBottom`.
-
+    *   Renders `<pre id="log-output">`. Client-side script subscribes to `wsManager.onLog` and `wsManager.onError`. Appends received log messages with timestamps to the `<pre>` element, handling auto-scrolling. Includes UI controls (`<Icon>`) for changing font size and clearing the log content.
 5.  **JSON Editor (`frontend/src/components/JsonEditor.astro`):**
-    *   Renders header with title, controls (font size +/-, format, update graph) using `<Icon>`, and `<div id="json-editor-container">`.
-    *   `<script>`:
-        *   `initializeEditor()`: Creates CodeMirror 6 `EditorView` instance (`editorView`) attached to `#json-editor-container`. Configures `EditorState` with `basicSetup`, `json()` language support, `jsonParseLinter`, `lintGutter`, and line wrapping. Sets initial content. Calls `updateEditorFontSize`. Adds button listeners. Subscribes to WebSocket manager.
-        *   `updateEditorContent(content)`: Updates the CodeMirror document with new content (stringifies objects with formatting).
-        *   `formatJsonContent()`: Gets current editor content, tries `JSON.parse`, and if successful, calls `updateEditorContent` with the parsed object (which gets re-stringified nicely). Shows alert on parse error.
-        *   `updateEditorFontSize(newSize)`: Updates font size style on the `.cm-editor` element, clamping values. Disables +/- buttons at limits.
-        *   `handleUpdateGraphClick()`: Parses current editor JSON. Validates basic structure (`concepts`, `relations` arrays). Dispatches `CustomEvent('update-graph-data', { detail: parsedData })` on `document.body`. Shows alert on success/failure.
-        *   Button `onclick` listeners call `updateEditorFontSize`, `formatJsonContent`, or `handleUpdateGraphClick`.
-        *   Subscribes to `wsManager.onResult` to call `updateEditorContent` with new data from the backend.
+    *   Uses CodeMirror 6 library. Renders editor in `<div id="json-editor-container">`. Client-side script initializes the editor with JSON language support and linting. Subscribes to `wsManager.onResult` to display the received raw JSON data. Includes UI controls (`<Icon>`) for font size, formatting JSON content, and an "Update Graph" button. Clicking "Update Graph" parses the current editor content, validates basic structure, and dispatches the `update-graph-data` `CustomEvent` for the GraphVisualizer to consume.
 
 **Folder Structure & File Descriptions (Summary):**
 
 ```
 .
 ├── api/
-│   └── main.py            # Backend: FastAPI application, WebSocket endpoint logic.
+│   └── main.py            # Backend: FastAPI, WebSocket endpoint, Pipeline instantiation/calling.
 ├── data/
-│   └── source/umls/META/  # Backend: UMLS RRF files (mounted r/o to app)
+│   └── source/umls/META/  # Backend: UMLS RRF files (mounted r/o)
 ├── db_setup/
-│   └── load_umls_to_pgsql.py # Backend: Script to load UMLS subset to PostgreSQL.
-├── frontend/              # Frontend: Astro application
-│   ├── public/            # Frontend: Static assets (e.g., favicon)
-│   ├── src/
-│   │   ├── components/    # Frontend: Astro components (InputForm, GraphVisualizer, etc.)
-│   │   ├── layouts/       # Frontend: Astro layout component (MainLayout.astro)
-│   │   ├── lib/           # Frontend: Client-side libraries (websocket.ts)
-│   │   ├── pages/         # Frontend: Astro pages (index.astro)
-│   │   └── styles/        # Frontend: CSS styles (global.css)
-│   ├── astro.config.mjs   # Frontend: Astro configuration (integrations: astro-icon)
-│   ├── package.json       # Frontend: Node.js dependencies
-│   └── tsconfig.json      # Frontend: TypeScript configuration
-├── scripts/
-│   ├── db_utils.py       # Backend: Database interaction functions.
-│   ├── process_phrase.py # Backend: Core NLP/Concept/Relation pipeline logic.
-│   ├── relation_extractor.py # Backend: Rule-based & KB relation extraction logic.
+│   └── load_umls_to_pgsql.py # Backend: DB loading script
+├── frontend/              # Frontend: Astro source + Nginx config
+│   ├── public/            # Frontend: Static assets (favicon, etc.)
+│   ├── src/               # Frontend: Astro components, pages, styles, websocket lib
+│   ├── astro.config.mjs
+│   ├── Dockerfile         # Frontend: Dockerfile (Node build + Nginx)
+│   ├── nginx.conf         # Frontend: Nginx configuration
+│   ├── package.json
+│   └── tsconfig.json
+├── pipelines/             # Backend: Modular pipeline implementations
+│   ├── __init__.py
+│   ├── base_pipeline.py   # Backend: BaseProcessingPipeline interface definition
+│   └── spacy_rule_based/  # Backend: Current default pipeline
+│       ├── __init__.py
+│       ├── processor.py     # Backend: SpacyRuleBasedPipeline class
+│       └── relation_extractor.py # Backend: Relation logic for spacy_rule_based
+├── scripts/               # Backend: Shared utility scripts
+│   ├── __init__.py
+│   └── db_utils.py        # Backend: Database interaction functions
 ├── .dockerignore
-├── .env.example           # Backend: Example environment variables
+├── .env.example           # Example environment variables
 ├── .gitignore
-├── docker-compose.yml   # Defines backend services (db, app). Runs FastAPI app.
-├── Dockerfile             # Builds the backend Python 'app' service image.
-├── entrypoint.sh          # Backend: Container startup script.
-└── requirements.txt       # Backend: Python dependencies.
+├── docker-compose.yml     # Defines services (db, app, frontend), networks, volumes.
+├── Dockerfile             # Backend: Dockerfile for 'app' service (Python)
+├── entrypoint.sh          # Backend: Container startup script (if used)
+└── requirements.txt       # Backend: Python dependencies
 ```
 
 **Current Status & Achievements:**
 
-*   Stable Docker environment for backend (PostgreSQL DB + FastAPI App).
-*   UMLS subset (MRCONSO, MRSTY, MRREL including NCIt) loaded and queryable.
-*   Backend concept/relation extraction pipeline functional via WebSocket API with real-time logging.
-*   **Fully functional Astro frontend application:**
-    *   Real-time WebSocket communication implemented.
-    *   Interactive components for input, logs, graph visualization, JSON output viewing/editing.
-    *   UI controls operational (zoom, font size, format, clear, update graph).
-    *   Graph updates from both WebSocket results and edited JSON.
-    *   Responsive layout with appropriate component scrolling.
+*   Stable Docker environment with separate, orchestrated containers (`db`, `app`, `frontend`).
+*   UMLS subset loaded and queryable via shared `scripts/db_utils.py`.
+*   **Backend processing logic successfully refactored into a modular pipeline structure**: `BaseProcessingPipeline` interface defined, current logic encapsulated in `SpacyRuleBasedPipeline`, API layer uses the interface.
+*   Backend development workflow supports hot-reloading via volume mounts.
+*   **Fully containerized Astro frontend application** served by Nginx, correctly proxying WebSocket requests.
+*   All frontend components (Input, Logs, Graph, JSON Editor) are functional and interact via the WebSocket manager.
 
 **Known Issues / Challenges:**
 
-1.  **Relation Rule Deficiencies:** Backend rules need refinement.
-2.  **Multi-Token Fallback:** Backend needs enhancement.
-3.  **Negation/Context:** Backend lacks handling.
-4.  **Frontend Error Handling:** Client-side error display could be improved.
-5.  **Frontend Cleanup:** Event listeners added in components are not explicitly removed on unload (minor issue in Astro's standard component model).
+1.  **Relation Rule Deficiencies:** `spacy_rule_based` rules need validation and refinement.
+2.  **Multi-Token Fallback:** Concept fallback in `spacy_rule_based` only handles single tokens.
+3.  **Negation/Context:** `spacy_rule_based` pipeline lacks sophisticated handling.
+4.  **Frontend Error Handling:** Client-side WebSocket error display/recovery could be improved.
+5.  **Pipeline Selection:** Currently hardcoded in `api/main.py`, needs configuration via env var.
 
 **Next Milestones / Immediate Focus:**
 
-1.  **Containerize Frontend:**
-    *   Modify `Dockerfile` or create a multi-stage build process.
-    *   Install Node.js, run `npm install` and `npm run build` for Astro frontend.
-    *   Configure a web server (FastAPI or Nginx) to serve static frontend files (`frontend/dist/`) from within Docker.
-2.  **Refine Relation Extraction:** Address backend rule limitations.
-3.  **Thesis Writing & Documentation:** Document the full system.
+1.  **Testing & Validation:** Thoroughly test the refactored `SpacyRuleBasedPipeline`.
+2.  **Implement Pipeline Configuration:** Use `PROCESSING_PIPELINE` env var.
+3.  **(Optional)** Create a `DummyPipeline` to test modularity swap.
+4.  **Refine `SpacyRuleBasedPipeline`:** Address known issues (rules, fallback, context).
+5.  **Thesis Writing & Documentation:** Document architecture, interface, implementation.
 
 --- END OF FILE context.txt ---
 ```
