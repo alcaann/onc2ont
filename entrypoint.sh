@@ -127,8 +127,8 @@ if ! check_db_populated; then
         echo "--- Running UMLS Data Loading Script (this will take a long time!) ---"
         # Execute the script. Ensure it uses the correct env vars if needed.
         # Use `python -u` for unbuffered output to see progress/errors sooner
-        # Ensure the script db_setup/load_umls_to_pgsql.py correctly reads env vars for DB connection
-        python -u db_setup/load_umls_to_pgsql.py
+        # Ensure the script scripts/load_umls_to_pgsql.py correctly reads env vars for DB connection
+        python -u scripts/load_umls_to_pgsql.py
 
         # Check the exit code of the python script
         load_exit_code=$?

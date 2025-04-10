@@ -99,8 +99,6 @@ Located in the `frontend/` directory. Built into static assets (`frontend/dist/`
 │   └── main.py            # Backend: FastAPI, WebSocket endpoint, Pipeline instantiation/calling.
 ├── data/
 │   └── source/umls/META/  # Backend: UMLS RRF files (mounted r/o)
-├── db_setup/
-│   └── load_umls_to_pgsql.py # Backend: DB loading script
 ├── frontend/              # Frontend: Astro source + Nginx config
 │   ├── public/            # Frontend: Static assets (favicon, etc.)
 │   ├── src/               # Frontend: Astro components, pages, styles, websocket lib
@@ -118,7 +116,8 @@ Located in the `frontend/` directory. Built into static assets (`frontend/dist/`
 │       └── relation_extractor.py # Backend: Relation logic for spacy_rule_based
 ├── scripts/               # Backend: Shared utility scripts
 │   ├── __init__.py
-│   └── db_utils.py        # Backend: Database interaction functions
+│   ├── db_utils.py        # Backend: Database interaction functions
+│   └── load_umls_to_pgsql.py # Backend: DB loading script
 ├── .dockerignore
 ├── .env.example           # Example environment variables
 ├── .gitignore

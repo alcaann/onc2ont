@@ -34,7 +34,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY scripts/ /app/scripts/
 # ADDED: Copy the new API directory
 COPY api/ /app/api/ 
-COPY db_setup/ /app/db_setup/
 COPY entrypoint.sh /app/entrypoint.sh
 # Copy other potential top-level files if needed (e.g., configuration)
 # COPY *.py /app/

@@ -1,4 +1,4 @@
-# db_setup/load_umls_to_pgsql.py
+# scripts/load_umls_to_pgsql.py
 import sys
 import os
 import time
@@ -25,7 +25,7 @@ except ImportError as e:
 
 # --- Configuration (Load from Environment Variables or defaults) ---
 DB_NAME = os.getenv('POSTGRES_DB', 'umls_postgres_db') # Match docker-compose
-DB_USER = os.getenv('POSTGRES_USER', 'test_user')     # Match docker-compose
+DB_USER = os.getenv('POSTGRES_USER', 'umls_user')     # Match docker-compose
 DB_PASSWORD = os.getenv('POSTGRES_PASSWORD')
 DB_HOST = os.getenv('DB_HOST', 'db')
 DB_PORT = os.getenv('DB_PORT', '5432')

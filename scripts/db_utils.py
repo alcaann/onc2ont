@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # --- Database Configuration ---
 DB_NAME = os.getenv('POSTGRES_DB', 'umls_postgres_db') # Match docker-compose
-DB_USER = os.getenv('POSTGRES_USER', 'test_user')     # Match docker-compose
+DB_USER = os.getenv('POSTGRES_USER', 'umls_user')     # Match docker-compose
 DB_PASSWORD = os.getenv('POSTGRES_PASSWORD')
 DB_HOST = os.getenv('DB_HOST', 'db')
 DB_PORT = os.getenv('DB_PORT', '5432')
