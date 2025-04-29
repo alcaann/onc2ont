@@ -1,156 +1,148 @@
-```
 --- START OF FILE context.txt ---
 
-**Project Goal:** Develop an AI pipeline for a thesis that takes short oncology patient phrases as input and outputs a list of **NCI Thesaurus (NCIt)** concepts and the detailed relationships between them. The project includes a **web application** for interactive input, visualization as a knowledge graph, viewing processing logs, and examining/editing the raw JSON output.
+**Project Goal:** Develop an AI pipeline for a thesis that takes short oncology patient phrases as input, processes them using **Apache cTAKES 6.0.0**, and outputs:
+1.  A standardized **JSON** structure containing extracted **NCI Thesaurus (NCIt)** concepts and relationships suitable for a web application frontend.
+2.  An **OWL 2** representation of the extracted information, compatible with tools like Protégé, using NCIt concepts where possible.
 
 **Environment & System Architecture:**
 
 1.  **Dockerized Environment:** Fully containerized using Docker Compose (`docker-compose.yml`). Runs via `docker compose up -d` after `docker compose build`.
-    *   `db`: PostgreSQL 15 (`umls_postgres_db`), using persistent data storage via Docker volume (`postgres_data`). Healthcheck enabled. Port 5432 mapped to host 5433 for external tools. Runs on internal `umls_net` network.
-    *   `app`: Backend Python 3.10 (`umls_processor_app`) image built via root `Dockerfile`. Runs FastAPI API via Uvicorn on port 8000 (internal to Docker). Provides WebSocket endpoint (`/ws`) for real-time communication. Uses volume mounts (`./api:/app/api`, `./scripts:/app/scripts`, `./pipelines:/app/pipelines`) for backend code hot-reloading during development (`--reload --reload-dir ...` enabled in `command`). Runs as non-root user `appuser`. Runs on `umls_net` network. Connects to `db` service. Responsible for running the selected AI processing pipeline.
-    *   `frontend`: Nginx (`umls_frontend_nginx`) image built via `frontend/Dockerfile`. Serves the static Astro frontend assets (built during the image build process using `npm run build`) on internal port 80. Maps host port **8080** to container port 80 for external access (`http://localhost:8080`). Uses `frontend/nginx.conf` to configure serving static files (with `try_files` for SPA fallback to `index.html`) and to **proxy** WebSocket requests (`location /ws { proxy_pass http://app:8000/ws; ... }`) to the `app` service. Runs on `umls_net` network. Depends on `app`.
+    *   `db`: PostgreSQL 15 (`umls_postgres_db`), persistent data (`postgres_data`). Contains UMLS subset (`MRCONSO`, `MRSTY`, `MRREL`) including **NCI Thesaurus (SAB='NCI')**. `pg_trgm` enabled. Port 5432 mapped to host 5433. Runs on internal `umls_net` network. Healthcheck enabled.
+    *   **`ctakes_wrapper`**: Custom-built service (`umls_ctakes_wrapper_service`) based on `pipelines/ctakes_based/Dockerfile.ctakes_wrapper`.
+        *   Runs on a **Java 17** base image (`eclipse-temurin:17-jre-jammy`) with Python 3 installed.
+        *   **Mounts** the local host directory `./pipelines/ctakes_based/apache-ctakes-6.0.0` to `/opt/apache-ctakes-6.0.0` inside the container as **read-write** (necessary for HSQLDB lock files).
+        *   Runs a lightweight **FastAPI application (`pipelines/ctakes_based/ctakes_wrapper_api.py`)** on internal port `8081`.
+        *   Receives the **UMLS API Key** via the `UMLS_API_KEY` environment variable (passed from `.env` via `docker-compose.yml`).
+        *   Exposes a `/process` endpoint that:
+            *   Receives raw text via POST.
+            *   Writes the text to a temporary input file.
+            *   Executes the cTAKES **file-based pipeline** (using `org.apache.ctakes.core.pipeline.PiperFileRunner` via `java -cp ...`) targeting the input file and a temporary output directory. Passes the `UMLS_API_KEY` using the `--key` argument (verified).
+            *   Waits for cTAKES to complete.
+            *   Reads the resulting `.xmi` file from the temporary output directory.
+            *   Returns the raw XMI content in the HTTP response.
+            *   Cleans up temporary files.
+        *   Includes a `/health` endpoint used by its Dockerfile `HEALTHCHECK`. Runs on `umls_net` network.
+    *   `app`: Backend Python 3.10 (`umls_processor_app`). Runs FastAPI API via Uvicorn on internal port 8000.
+        *   Provides WebSocket endpoint (`/ws`). Uses volume mounts for hot-reloading (`./api:/app/api`, etc.).
+        *   Connects to `db` service (`DB_HOST=db`).
+        *   Connects to the **`ctakes_wrapper`** service using the URL specified by `CTAKES_URL` (e.g., `http://ctakes_wrapper:8081/process`).
+        *   Dynamically loads and runs the configured pipeline class (currently `CTakesPipeline`).
+        *   Responsible for calling the `ctakes_wrapper` API, parsing the returned XMI, querying the local `db` for NCI semantic types, formatting JSON, triggering OWL generation, and communicating results via WebSocket.
+        *   Runs on `umls_net` network. Depends on healthy `db` and `ctakes_wrapper`.
+    *   `frontend`: Nginx (`umls_frontend_nginx`). Serves static Astro frontend assets. Maps host port **8080** to container port 80. Proxies WebSocket requests (`/ws`) to the `app` service. Runs on `umls_net` network. Depends on `app`.
 
 2.  **Data Handling & Status:**
-    *   **UMLS Subset:** Successfully loaded into the persistent PostgreSQL `db` service. Contains `MRCONSO`, `MRSTY`, `MRREL` tables from UMLS, specifically including **NCI Thesaurus (SAB='NCI')**. Data persists across container restarts. `pg_trgm` extension is enabled in the database for efficient partial string matching.
-    *   **Database Connection:** `psycopg2-binary` library used in the `app` service for DB connection. Connection details (host, port, dbname, user, password) are passed via environment variables, with `DB_HOST=db` targeting the database service on the Docker network.
-    *   **Source Data Mount:** Host UMLS RRF source files (`./data/source/umls/META`) are mounted read-only into the `app` container at `/app/data/source/umls/META`. This is currently *not* used by the pipeline but available if needed later.
+    *   **UMLS Subset:** Loaded and queryable in PostgreSQL `db` service. Used by `app` service to fetch semantic types (`MRSTY` where `SAB='NCI'`) for concepts identified by cTAKES. Potentially used later for relation extraction (querying `MRREL`).
+    *   **cTAKES 6.0.0 Distribution:** Located on the host machine at `./pipelines/ctakes_based/apache-ctakes-6.0.0` and mounted read-write into the `ctakes_wrapper` container. Includes required binaries, libraries, resources, and pipeline descriptors (`.piper` files, found under `resources/` in this version).
+    *   **UMLS Authentication:** Handled via **API Key** (`UMLS_API_KEY` in `.env`), passed to the `ctakes_wrapper` container, which passes it to the cTAKES `PiperFileRunner` using the `--key` argument.
 
-**Core Backend Pipeline Architecture (Modular):**
+**Core Backend Pipeline Architecture:**
 
-The backend processing logic is designed to be modular and swappable, centered around an Abstract Base Class defining a common interface. This allows different AI model implementations to be tested.
+Modular via `BaseProcessingPipeline` ABC (`pipelines/base_pipeline.py`).
 
-1.  **Pipeline Interface (`pipelines/base_pipeline.py`):**
-    *   Defines the `BaseProcessingPipeline(ABC)` abstract class.
-    *   Requires all concrete pipeline implementations to implement the `process` method signature:
-        *   `process(self, phrase: str, log_func: Optional[Callable[[str], None]] = None) -> Dict[str, List[Dict[str, Any]]]`
-        *   **Input:**
-            *   `phrase`: The user's input text phrase (string).
-            *   `log_func`: An optional callback function provided by the API layer. Pipelines should call this function with string messages to report progress or steps in real-time. This function handles thread-safe asynchronous communication back to the API (e.g., for WebSocket streaming).
-        *   **Output:** Must return a dictionary containing exactly two keys:
-            *   `'concepts'`: A list of concept dictionaries. Standardized format expected: `{'cui': str, 'matched_term': str, 'text_span': str, 'start_char': int, 'end_char': int, 'sem_types': List[str], 'score': float, 'source': str}` (e.g., source='ner', 'fallback_token'). List should ideally be sorted by `start_char`.
-            *   `'relations'`: A list of relation dictionaries. Standardized format expected: `{'subject_cui': str, 'object_cui': str, 'relation': str, 'source': str, 'subj_text': str, 'obj_text': str}` (e.g., source='rule-based', 'kb-lookup (NCI)').
+1.  **Primary Implementation (`pipelines/ctakes_based/processor.py`):**
+    *   `CTakesPipeline(BaseProcessingPipeline)` class.
+    *   **Initialization (`__init__`)**: Stores the `ctakes_wrapper` service URL (`CTAKES_URL` env var). Initializes a `requests.Session`. No direct authentication logic needed here.
+    *   **`process` Method Implementation:**
+        *   Takes `phrase` and `log_func`.
+        *   Sends `phrase` via HTTP POST to the `ctakes_wrapper` service URL. Handles timeouts and HTTP errors from the wrapper.
+        *   Receives **raw XMI** content in the response body (`response.content`).
+        *   **Parses XMI:** Uses `lxml` library to process the received XMI string. Extracts `cas:Sofa` string.
+        *   **Extracts Concepts (Mentions):** Iterates through relevant `textsem:*Mention` elements. Extracts `xmi:id`, `begin`, `end`, `polarity`, `uncertainty`, etc. Looks up corresponding `refsem:UmlsConcept` elements via `ontologyConceptArr` to get CUI(s). Selects primary CUI.
+        *   **Fetches SemTypes:** Uses primary CUI and `TARGET_ONTOLOGY_SAB` ('NCI') to query the local `db` via `scripts.db_utils.get_semantic_types_for_cui`.
+        *   Formats results into the standard `'concepts'` list structure defined in `BaseProcessingPipeline`.
+        *   **Extracts Relations (Placeholder):** Attempts to find and parse `relation:BinaryTextRelation` elements if present in the XMI. Formats into the standard `'relations'` list. **Currently expects this list to be empty as the default cTAKES pipeline (`DefaultFastPipeline.piper`) likely doesn't perform relation extraction.**
+        *   Returns `{'concepts': final_concepts, 'relations': final_relations}` dictionary.
 
-2.  **Current Implementation (`pipelines/spacy_rule_based/`):**
-    *   The primary implementation is `SpacyRuleBasedPipeline(BaseProcessingPipeline)` located in `pipelines/spacy_rule_based/processor.py`.
-    *   **Initialization (`__init__`)**: Loads the configured ScispaCy model (`en_ner_bc5cdr_md` by default via `spacy.load()`) into `self.nlp`. Logs success or critical failure if the model cannot be loaded. Stores configuration (like `TARGET_SOURCE='NCI'`, `FALLBACK_SCORE_THRESHOLD`, `LABEL_TO_SEMANTIC_TYPES`) as class or instance attributes.
-    *   **`process` Method Implementation:** Orchestrates the steps:
-        *   Takes `phrase` and `log_func`. Uses an internal `_log` helper to route messages to `log_func` and the backend `self.logger`.
-        *   Runs NLP pipeline: `doc = self.nlp(phrase)`. This performs tokenization, POS tagging, dependency parsing, and NER.
-        *   **NER Concept Extraction:** Iterates through `doc.ents` (entities identified by ScispaCy NER). For each entity:
-            *   Calls `self._get_filtered_db_matches(entity_text, entity_label)`. This helper queries the DB (using shared `scripts.db_utils.find_concept_by_term_and_source` for exact then partial NCI matches), retrieves semantic types (`scripts.db_utils.get_semantic_types_for_cui`), filters results based on `EXCLUDE_SEMANTIC_TYPES` and `LABEL_TO_SEMANTIC_TYPES` mappings, calculates a score (`rapidfuzz.fuzz.ratio` + exact match bonus), and returns ranked matches.
-            *   Selects the best-scoring match if its CUI hasn't been added yet, logs it, and appends to `final_concepts`. Stores the span (`start_char`, `end_char`) to avoid overlap in fallback.
-        *   **Fallback Concept Extraction:** Iterates through individual spaCy `Tokens` in the `doc`. Skips tokens overlapping with already processed NER entity spans or those with irrelevant POS tags (e.g., not in `NOUN`, `PROPN`, `ADJ`).
-            *   Calls `self._get_filtered_db_matches(token_text, "UNKNOWN")` for promising tokens.
-            *   Selects the best match only if its score meets a strict `FALLBACK_SCORE_THRESHOLD` (currently requires exact match bonus) and the CUI hasn't been added. Logs it and appends to `final_concepts`.
-        *   **Relation Extraction Call:** If 2 or more concepts are found and the spaCy `parser` component loaded correctly:
-            *   Calls `extract_relations_hybrid(doc, final_concepts, log_func)` from the sibling module `pipelines.spacy_rule_based.relation_extractor`.
-        *   Returns the final `{'concepts': final_concepts, 'relations': extracted_relations}` dictionary (concepts sorted by start char).
-    *   **Relation Extraction Logic (`pipelines/spacy_rule_based/relation_extractor.py`):**
-        *   Contains `extract_relations_hybrid(doc, concepts, log_func)`.
-        *   Uses helper `map_concepts_to_spans` to align concept dicts (with char offsets) to spaCy `Span` objects.
-        *   Filters concepts based on CUI (`EXCLUDE_CUIS_FROM_RELATIONS`) exclusion list.
-        *   Iterates through pairs (`itertools.combinations`) of eligible concept spans.
-        *   For each pair, calls `apply_dependency_rules(span1, span2, concept_details, log_func)`. This function implements rule-based logic using spaCy dependency parse trees (`token.dep_`, `token.head`). Checks patterns like prepositional attachments (`pobj` of `prep`, using `PREPOSITION_MAP`), verb-mediated relations (`nsubj`, `dobj` connected by known verbs in `VERB_MAP`), adjectival modifiers (`amod`), and conjunctions (`conj`). Logs rule matches via `log_func`.
-        *   If no rule matches, calls `lookup_kb_relation(cui1, cui2, log_func)` as a fallback. This queries the `MRREL` table via `scripts.db_utils.get_relations_for_cui_pair` for pre-existing UMLS relationships. It then calls `select_best_kb_relation` to filter/rank results based on source (`KB_SAB_PRIORITY`) and relation type (`KB_RELA_PRIORITY`, `KB_REL_IGNORE`). Logs KB lookup results via `log_func`.
-        *   Returns the final list of relation dictionaries, including `source` ('rule-based' or 'kb-lookup (SAB)').
+2.  **API Integration (`api/main.py`):**
+    *   Loads `.env` variables.
+    *   Dynamically imports and instantiates the pipeline class specified by `PROCESSING_PIPELINE` env var on startup. Handles loading errors.
+    *   WebSocket endpoint (`/ws`):
+        *   Accepts connection only if pipeline loaded successfully.
+        *   Receives `{'type': 'process_phrase', ...}` message.
+        *   Manages async tasks for processing, logging, and OWL generation.
+        *   Calls `processing_pipeline.process(phrase, log_func=log_callback_sync)` in a separate thread.
+        *   Receives the JSON `result` dictionary.
+        *   Sends JSON result to frontend: `{type: 'result', ...}`.
+        *   **Triggers OWL Generation:** Calls `scripts.owl_generator.generate_owl(result['concepts'], result['relations'])` in a separate thread.
+        *   Sends OWL result string to frontend: `{type: 'owl_result', ...}`. Handles errors during OWL generation.
 
-3.  **API Integration (`api/main.py`):**
-    *   Imports `BaseProcessingPipeline` and specific implementations (e.g., `SpacyRuleBasedPipeline`).
-    *   **Instantiates** the desired pipeline class on startup (currently hardcoded to `SpacyRuleBasedPipeline`, intended to be configurable via `PROCESSING_PIPELINE` env var). Stores the singleton instance in the global `processing_pipeline` variable. Includes logging and error handling for initialization failures (checks if `nlp` model loaded for SpaCy pipeline).
-    *   The WebSocket endpoint (`@app.websocket("/ws")`) checks if `processing_pipeline` is not `None` before accepting connections.
-    *   When a `{'type': 'process_phrase', 'payload': '...'}` message is received, the API endpoint:
-        *   Manages connection lifecycle and cleanup of previous tasks.
-        *   Uses an `asyncio.Queue` (`log_queue`) for receiving logs from the processing thread.
-        *   Spawns an `async def send_logs()` task to read from `log_queue` and send `{type: 'log', ...}` messages to the client.
-        *   Defines `log_callback_sync(message)`: A synchronous function passed to the pipeline, uses `main_event_loop.call_soon_threadsafe` to put log messages onto `log_queue`.
-        *   Calls the core processing in a separate thread to avoid blocking the async loop: `await asyncio.to_thread(processing_pipeline.process, phrase, log_func=log_callback_sync)`. **Crucially, it calls the `process` method of the instantiated `processing_pipeline` object.**
-        *   Sends the final `{type: 'result', ...}` or `{type: 'error', ...}` message upon completion or failure. Handles task cancellation and cleanup.
+3.  **OWL Generation (`scripts/owl_generator.py`):**
+    *   Uses `rdflib` library.
+    *   Defines namespaces (custom `MYNS`, `NCIT`, `RO`, standard RDF/RDFS/OWL/XSD).
+    *   Maps extracted `concepts` (mentions) to `owl:NamedIndividual` instances.
+    *   Maps concept CUIs to `owl:Class` instances (using `MYNS` or potentially `NCIT` namespace).
+    *   Adds `rdf:type` assertions linking individuals to their classes.
+    *   Adds data properties (defined in `MYNS`) to individuals based on extracted mention details (span, polarity, source, CUI, etc.).
+    *   Maps extracted `relations` (if any) using a `DEFAULT_RELATION_MAP` (prioritizing standard `RO` properties) to create `owl:ObjectProperty` assertions between individuals.
+    *   Serializes the final RDF graph to **OWL 2 RDF/XML format** using `g.serialize(format='pretty-xml')`.
 
-4.  **Shared Utilities (`scripts/`):**
-    *   Common functions intended to be reusable across different potential pipeline implementations.
-    *   `scripts/db_utils.py`: Contains functions for interacting with the UMLS PostgreSQL database (`get_db_connection`, `find_concept_by_term_and_source`, `get_semantic_types_for_cui`, `get_relations_for_cui_pair`). These are essential for mapping text to concepts and looking up existing relations.
+**Frontend Application (Astro):**
 
-**Frontend Application (Astro) & Key Logic:**
+*   Communicates via WebSocket managed by `frontend/src/lib/websocket.ts`.
+*   Receives `'log'`, `'result'` (JSON), `'owl_result'`, and `'error'` messages.
+*   `GraphVisualizer.astro` uses Cytoscape.js to display the graph based on the `'result'` payload.
+*   Other components display logs (`LogConsole.astro`), allow JSON editing (`JsonEditor.astro`), and handle input (`InputForm.astro`).
 
-Located in the `frontend/` directory. Built into static assets (`frontend/dist/`) during Docker image creation and served by the `frontend` Nginx container.
-
-1.  **WebSocket Manager (`frontend/src/lib/websocket.ts`):**
-    *   Exports `wsManager` object to handle WebSocket communication.
-    *   `connect()`: Establishes WebSocket connection to the Nginx proxy using a **relative URL** (`ws://${window.location.host}/ws`). Handles `onopen`, `onmessage`, `onerror`, `onclose`. Implements automatic reconnection logic with `RECONNECT_DELAY`.
-    *   `disconnect()`: Manually closes the WebSocket connection.
-    *   `sendMessage(type: string, payload: any)`: Sends JSON messages (e.g., `{type: 'process_phrase', ...}`) to the backend via Nginx. Updates internal status to 'processing'.
-    *   `onLog(callback)`, `onResult(callback)`, `onError(callback)`, `onStatusChange(callback)`: Registration methods allowing components to subscribe to incoming messages or status changes (e.g., 'connected', 'disconnected', 'processing', 'error'). Return unsubscribe functions.
-    *   Manages internal state (`isConnected`, `isProcessing`) and notifies listeners. Updates a global status indicator (`#connection-status`) in the layout.
-
-2.  **Input Form (`frontend/src/components/InputForm.astro`):**
-    *   Renders `<textarea>` and `<button>`. Client-side script handles form submission (button click or Enter), calls `wsManager.sendMessage('process_phrase', ...)` if connected and not already processing. Disables button while processing based on `wsManager.onStatusChange`.
-3.  **Graph Visualizer (`frontend/src/components/GraphVisualizer.astro`):**
-    *   Uses Cytoscape.js library. Renders graph in `#cy-container`. Client-side script initializes or updates the graph (`cyInstance`) based on data received via `wsManager.onResult`. Maps `concepts` to nodes and `relations` to edges. Also listens for `update-graph-data` custom event (dispatched by JsonEditor) to update graph from edited data. Includes UI controls (`<Icon>`) for zoom in/out/reset, which call `cyInstance` methods. Handles window resizing. Displays tooltips on node hover.
-4.  **Log Console (`frontend/src/components/LogConsole.astro`):**
-    *   Renders `<pre id="log-output">`. Client-side script subscribes to `wsManager.onLog` and `wsManager.onError`. Appends received log messages with timestamps to the `<pre>` element, handling auto-scrolling. Includes UI controls (`<Icon>`) for changing font size and clearing the log content.
-5.  **JSON Editor (`frontend/src/components/JsonEditor.astro`):**
-    *   Uses CodeMirror 6 library. Renders editor in `<div id="json-editor-container">`. Client-side script initializes the editor with JSON language support and linting. Subscribes to `wsManager.onResult` to display the received raw JSON data. Includes UI controls (`<Icon>`) for font size, formatting JSON content, and an "Update Graph" button. Clicking "Update Graph" parses the current editor content, validates basic structure, and dispatches the `update-graph-data` `CustomEvent` for the GraphVisualizer to consume.
-
-**Folder Structure & File Descriptions (Summary):**
+**Folder Structure & File Descriptions (Relevant Additions/Changes):**
 
 ```
 .
+├── pipelines/
+│   ├── ctakes_based/
+│   │   ├── __init__.py
+│   │   ├── apache-ctakes-6.0.0/    # <-- Local cTAKES files (Mounted, not in image)
+│   │   ├── ctakes_wrapper_api.py   # <-- NEW: FastAPI wrapper script
+│   │   ├── Dockerfile.ctakes_wrapper # <-- NEW: Dockerfile for wrapper service
+│   │   └── processor.py            # <-- Pipeline class calling the wrapper API
+│   ├── spacy_rule_based/           # (Alternative pipeline, unchanged)
+│   └── base_pipeline.py          # (Interface definition, docstring updated)
+├── scripts/
+│   ├── owl_generator.py          # <-- NEW: Generates OWL output
+│   └── db_utils.py               # (DB interaction functions)
 ├── api/
-│   └── main.py            # Backend: FastAPI, WebSocket endpoint, Pipeline instantiation/calling.
-├── data/
-│   └── source/umls/META/  # Backend: UMLS RRF files (mounted r/o)
-├── frontend/              # Frontend: Astro source + Nginx config
-│   ├── public/            # Frontend: Static assets (favicon, etc.)
-│   ├── src/               # Frontend: Astro components, pages, styles, websocket lib
-│   ├── astro.config.mjs
-│   ├── Dockerfile         # Frontend: Dockerfile (Node build + Nginx)
-│   ├── nginx.conf         # Frontend: Nginx configuration
-│   ├── package.json
-│   └── tsconfig.json
-├── pipelines/             # Backend: Modular pipeline implementations
-│   ├── __init__.py
-│   ├── base_pipeline.py   # Backend: BaseProcessingPipeline interface definition
-│   └── spacy_rule_based/  # Backend: Current default pipeline
-│       ├── __init__.py
-│       ├── processor.py     # Backend: SpacyRuleBasedPipeline class
-│       └── relation_extractor.py # Backend: Relation logic for spacy_rule_based
-├── scripts/               # Backend: Shared utility scripts
-│   ├── __init__.py
-│   ├── db_utils.py        # Backend: Database interaction functions
-│   └── load_umls_to_pgsql.py # Backend: DB loading script
-├── .dockerignore
-├── .env.example           # Example environment variables
-├── .gitignore
-├── docker-compose.yml     # Defines services (db, app, frontend), networks, volumes.
-├── Dockerfile             # Backend: Dockerfile for 'app' service (Python)
-├── entrypoint.sh          # Backend: Container startup script (if used)
-└── requirements.txt       # Backend: Python dependencies
+│   └── main.py                   # (FastAPI, WebSocket, dynamic pipeline loading, triggers OWL)
+├── .env                          # <-- Contains UMLS_API_KEY and other secrets
+├── .env.example                  # <-- Example environment variables
+├── docker-compose.yml            # (Defines db, ctakes_wrapper, app, frontend services)
+├── Dockerfile                    # (Builds the 'app' service)
+└── requirements.txt              # (Added requests, lxml, rdflib)
 ```
 
 **Current Status & Achievements:**
 
-*   Stable Docker environment with separate, orchestrated containers (`db`, `app`, `frontend`).
-*   UMLS subset loaded and queryable via shared `scripts/db_utils.py`.
-*   **Backend processing logic successfully refactored into a modular pipeline structure**: `BaseProcessingPipeline` interface defined, current logic encapsulated in `SpacyRuleBasedPipeline`, API layer uses the interface.
-*   Backend development workflow supports hot-reloading via volume mounts.
-*   **Fully containerized Astro frontend application** served by Nginx, correctly proxying WebSocket requests.
-*   All frontend components (Input, Logs, Graph, JSON Editor) are functional and interact via the WebSocket manager.
+*   Stable Docker environment with orchestrated services (`db`, `ctakes_wrapper`, `app`, `frontend`).
+*   UMLS subset loaded and queryable via `scripts/db_utils.py`.
+*   Successfully integrated **file-based cTAKES 6.0.0 execution** via a custom internal wrapper API (`ctakes_wrapper` service).
+*   cTAKES authentication handled via **UMLS API Key**.
+*   cTAKES Java version mismatch resolved (using Java 17).
+*   Volume mount permissions issue resolved (using read-write mount).
+*   Backend `CTakesPipeline` successfully calls the wrapper, receives XMI, and parses it (basic execution flow works without fatal errors).
+*   Backend API dynamically loads the selected pipeline.
+*   Basic structure for OWL 2 generation using `rdflib` is in place (`scripts/owl_generator.py`).
+*   Frontend application is functional for input/output display via WebSockets.
 
 **Known Issues / Challenges:**
 
-1.  **Relation Rule Deficiencies:** `spacy_rule_based` rules need validation and refinement.
-2.  **Multi-Token Fallback:** Concept fallback in `spacy_rule_based` only handles single tokens.
-3.  **Negation/Context:** `spacy_rule_based` pipeline lacks sophisticated handling.
-4.  **Frontend Error Handling:** Client-side WebSocket error display/recovery could be improved.
-5.  **Pipeline Selection:** Currently hardcoded in `api/main.py`, needs configuration via env var.
+1.  **Frontend Display:** Concepts successfully processed by the backend (likely present in the received XMI) are **not appearing** in the frontend knowledge graph. This suggests an issue in the data flow *after* XMI parsing: XMI parsing logic itself (`processor.py`), JSON formatting (`processor.py`), WebSocket transmission (`main.py`), or frontend data consumption/rendering (`GraphVisualizer.astro`).
+2.  **Relation Extraction:** The current setup uses a default cTAKES pipeline (`DefaultFastPipeline.piper`) which likely **does not perform relation extraction**. The `'relations'` list in the JSON/OWL output is expected to be empty. Implementing relation extraction is a major next step.
+3.  **OWL Relation Mapping:** The `DEFAULT_RELATION_MAP` in `owl_generator.py` needs to be populated with correct mappings once relation types are actually extracted.
+4.  **cTAKES Pipeline Tuning:** The `DefaultFastPipeline.piper` might not be optimal. Customizing the cTAKES pipeline could improve concept recognition or enable relation extraction but requires understanding cTAKES configuration.
+5.  **Error Handling Robustness:** Error handling in the wrapper API and main app could be further improved for edge cases.
 
 **Next Milestones / Immediate Focus:**
 
-1.  **Testing & Validation:** Thoroughly test the refactored `SpacyRuleBasedPipeline`.
-2.  **Implement Pipeline Configuration:** Use `PROCESSING_PIPELINE` env var.
-3.  **(Optional)** Create a `DummyPipeline` to test modularity swap.
-4.  **Refine `SpacyRuleBasedPipeline`:** Address known issues (rules, fallback, context).
-5.  **Thesis Writing & Documentation:** Document architecture, interface, implementation.
+1.  **Debug Frontend Concept Display:**
+    *   Trace data: Add detailed logging in `CTakesPipeline.process` after XMI parsing to confirm concepts *are* being extracted into `final_concepts`.
+    *   Log the JSON payload *before* it's sent via WebSocket in `api/main.py`.
+    *   Use browser developer tools to inspect the actual WebSocket message received by the frontend.
+    *   Debug the `GraphVisualizer.astro` component's client-side script to see why it isn't rendering nodes based on the received `concepts` data.
+2.  **Plan Relation Extraction Strategy:**
+    *   **Option A (cTAKES):** Research cTAKES 6.0.0 relation extraction components (e.g., coreference, dependency parsing + relation annotators). Investigate how to modify/create a `.piper` file to include these and configure the `ctakes_wrapper` to use the new pipeline. Assess feasibility and complexity.
+    *   **Option B (Post-processing):** Keep the cTAKES pipeline for NER only. Implement relation extraction logic within the `CTakesPipeline.process` method (in `app`) after getting concepts from XMI. This could use rules (dependency-based, keyword-based) or knowledge base lookups (querying `MRREL` in the local DB).
+    *   **Option C (Hybrid):** Use cTAKES for some relations (e.g., anatomical locations) and post-processing for others.
+3.  **Implement Chosen Relation Extraction:** Add the necessary code based on the chosen strategy.
+4.  **Refine OWL Generation:** Update `owl_generator.py` with correct relation property mappings and ensure output conforms to OWL 2 standards and project requirements.
+5.  **Thesis Writing & Documentation:** Document the final architecture, implementation details, cTAKES integration, OWL mapping, and results.
 
---- END OF FILE context.txt ---
-```
+--- END OF UPDATED context.txt ---

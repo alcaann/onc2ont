@@ -1,4 +1,18 @@
-# --- START OF MODIFIED docker-compose.yml ---
+# FILE: docker-compose.yml
+# (Replace the content of your existing file with this)
+
+version: '3.8'
+
+networks:
+  umls_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  # Note: We are now mounting the cTAKES distribution directly,
+  # so a separate volume for resources might be less necessary unless
+  # you want specific resource overrides separate from the main mount.
+
 services:
   db:
     image: postgres:15
@@ -6,11 +20,12 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     environment:
+      # Use environment variables defined in .env file or default values
       POSTGRES_DB: ${POSTGRES_DB:-umls_db}
       POSTGRES_USER: ${POSTGRES_USER:-umls_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_very_secure_password_here}
-    # Map host port 5433 to container port 5432 for external DB tools
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_very_secure_password_here} # Use a secure password!
     ports:
+      # Map host port 5433 -> container 5432 for external tools access
       - "5433:5432"
     networks:
       - umls_net
@@ -21,60 +36,87 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # --- NEW cTAKES Wrapper Service ---
+  ctakes_wrapper:
+    build:
+      context: . # Build from the project root
+      dockerfile: ./pipelines/ctakes_based/Dockerfile.ctakes_wrapper # Path to the wrapper Dockerfile
+    container_name: umls_ctakes_wrapper_service
+    volumes:
+      # Mount your local cTAKES 6.0.0 directory into the container at the path expected by CTAKES_HOME
+      # Ensure the source path './pipelines/ctakes_based/apache-ctakes-6.0.0' is correct relative to docker-compose.yml
+      - ./pipelines/ctakes_based/apache-ctakes-6.0.0:/opt/apache-ctakes-6.0.0:rw # ':rw' to allow cTAKES internal processes (like HSQLDB lock files) to write
+    environment:
+      # Pass NLM UMLS Credentials needed by the cTAKES pipeline runner script/process
+      # These MUST be set in your .env file
+      UMLS_API_KEY: ${UMLS_API_KEY}
+      # Optional: Override default piper file path used by the wrapper API if needed
+      # PIPER_FILE_PATH: 'path/to/your/custom.piper'
+      # Optional: Adjust log level for the wrapper API script itself
+      # LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - umls_net
+    ports:
+      # Expose the wrapper API port ONLY internally to the docker network
+      - "8081"
+      # If you need direct access from host for debugging the wrapper API:
+      # - "8082:8081" # Host port 8082 -> Container port 8081
+    # Healthcheck is defined within the Dockerfile.ctakes_wrapper now
+    depends_on:
+      # Doesn't strictly depend on DB, but ensures network is up
+      - db
+    restart: unless-stopped
+
+  # --- Updated App Service ---
   app: # Backend Python/FastAPI service
     build:
-      context: . # Build using the top-level Dockerfile
+      context: .
       dockerfile: Dockerfile
     container_name: umls_processor_app
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Database Connection
       POSTGRES_DB: ${POSTGRES_DB:-umls_db}
       POSTGRES_USER: ${POSTGRES_USER:-umls_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_very_secure_password_here}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_very_secure_password_here} # Use the same secure password
       DB_HOST: db
       DB_PORT: 5432
+      # Pipeline Configuration
+      PROCESSING_PIPELINE: ${PROCESSING_PIPELINE:-pipelines.ctakes_based.processor.CTakesPipeline} # Still points to our processor class
+      TARGET_ONTOLOGY_SAB: ${TARGET_ONTOLOGY_SAB:-NCI} # SAB for DB Lookups
+      # cTAKES Connection Details - UPDATED URL to point to the wrapper service
+      # The URL now targets the ctakes_wrapper service on port 8081 and its /process endpoint
+      CTAKES_URL: ${CTAKES_URL:-http://ctakes_wrapper:8081/process}
+      # REMOVED CTAKES_USER/CTAKES_PASSWORD as they are not needed for the wrapper API call itself
+      # UMLS credentials are now passed directly to the ctakes_wrapper service instead.
       # PYTHON variables set in Dockerfile
     volumes:
-      # Mount the source UMLS data read-only (Keep this)
+      # Mount the UMLS source data (if still needed by app/scripts directly)
       - ./data/source/umls/META:/app/data/source/umls/META:ro
-      # --- RE-ADD Mount local code for backend development & hot-reloading ---
+      # Mount local code for backend development & hot-reloading
       - ./api:/app/api:rw
       - ./scripts:/app/scripts:rw
       - ./pipelines:/app/pipelines:rw
-      # Note: If you modify requirements.txt, you WILL need to rebuild the image.
-      # Note: Ensure entrypoint.sh is copied via Dockerfile, not mounted, unless intended.
     networks:
       - umls_net
     depends_on:
       db:
         condition: service_healthy
-    # --- REMOVED Port mapping ---
-    # ports:
-    #   - "8000:8000" # No longer expose backend directly to host (Nginx will proxy)
-    # --- RE-ADD --reload for development ---
-    # Make sure uvicorn is installed with [standard] in requirements.txt for watchfiles
+      ctakes_wrapper: # <-- DEPENDS ON the new wrapper service
+        condition: service_healthy # Wait for the wrapper API to be ready (uses HEALTHCHECK)
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/api --reload-dir /app/scripts --reload-dir /app/pipelines
     restart: unless-stopped
 
-  frontend: # New Frontend Nginx service
+  frontend: # Frontend Nginx service
     build:
-      context: ./frontend # Build using the frontend/Dockerfile
+      context: ./frontend
       dockerfile: Dockerfile
     container_name: umls_frontend_nginx
     ports:
-      # Map host port 8080 to container port 80 (Nginx default)
       # Access the app via http://localhost:8080
       - "8080:80"
     networks:
       - umls_net
     depends_on:
-      - app # Optional, but good practice. Nginx proxy handles backend failures.
+      - app
     restart: unless-stopped
-
-networks:
-  umls_net:
-    driver: bridge
-
-volumes:
-  postgres_data:
-# --- END OF MODIFIED docker-compose.yml ---

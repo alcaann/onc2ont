@@ -26,5 +26,7 @@ database/
 # If you MUST keep data/source in git, remove this line, but beware of repo size.
 data/source/
 
+pipelines/ctakes_based/apache-ctakes-6.0.0
+
 # Git files
 .git

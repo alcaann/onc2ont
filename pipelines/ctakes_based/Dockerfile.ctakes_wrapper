@@ -1,0 +1,56 @@
+# FILE: pipelines/ctakes_based/Dockerfile.ctakes_wrapper
+# (Updated to use Java 17 and compatible Python install)
+
+# Start with an official OpenJDK 17 base image (e.g., based on Debian Bullseye/Bookworm)
+# Using 'eclipse-temurin' as it's a popular, well-supported OpenJDK distribution
+FROM eclipse-temurin:17-jre-jammy
+# Alternatively: FROM openjdk:17-jre-slim (check which Debian version it's based on if issues arise)
+
+# Set environment variables consistently for locale and Python
+ENV LANG C.UTF-8
+ENV LC_ALL C.UTF-8
+ENV PYTHONUNBUFFERED 1
+# JAVA_HOME should be correctly set by the openjdk/temurin base image
+
+# Install Python 3 (the default python3 on Jammy/Bookworm should be >= 3.10), pip, and curl
+# 'jammy' (Ubuntu 22.04 base for eclipse-temurin) or Bookworm (Debian 12) have recent Python 3
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+       python3 \
+       python3-pip \
+       python3-venv \
+       curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    # Ensure pip is up to date for python3
+    && python3 -m pip install --no-cache-dir --upgrade pip
+
+# Set the working directory for cTAKES mount
+WORKDIR /opt
+
+# --- cTAKES Directory ---
+# cTAKES distribution will be mounted here via docker-compose.yml volume
+ENV CTAKES_HOME=/opt/apache-ctakes-6.0.0
+
+# --- Setup Wrapper API ---
+RUN mkdir -p /app /ctakes_io/input /ctakes_io/output
+
+# Copy the wrapper API script
+COPY ./pipelines/ctakes_based/ctakes_wrapper_api.py /app/ctakes_wrapper_api.py
+
+# Install Python dependencies for the wrapper API using python3's pip
+RUN python3 -m pip install --no-cache-dir fastapi "uvicorn[standard]" python-dotenv lxml
+
+# Expose the port the wrapper API will run on
+EXPOSE 8081
+
+# Set the working directory for running the API script
+WORKDIR /app
+
+# --- Container Healthcheck (Optional but Recommended) ---
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD curl --fail http://localhost:8081/health || exit 1
+
+# --- Container Execution ---
+# Use python3 (the default installed version) to run uvicorn
+CMD ["python3", "-m", "uvicorn", "ctakes_wrapper_api:app", "--host", "0.0.0.0", "--port", "8081", "--log-level", "info"]
