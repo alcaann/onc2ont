@@ -1,13 +1,21 @@
 // --- START OF UPDATED frontend/src/lib/websocket.ts ---
 
+// Define the structure for the result payload
+interface ResultPayload {
+    json_data: { // Contains the concepts and relations
+        concepts: any[];
+        relations: any[];
+    };
+    raw_xmi: string; // The raw XMI string
+}
+
 // Define callback function types
 type LogCallback = (message: string) => void;
-type ResultCallback = (data: { concepts: any[]; relations: any[] }) => void;
+type ResultCallback = (data: ResultPayload) => void; // Updated type
 type ErrorCallback = (error: string) => void;
 type StatusCallback = (status: 'connected' | 'disconnected' | 'processing' | 'error') => void;
 
 // Configuration
-// const WEBSOCKET_URL = "ws://localhost:8000/ws"; // --- REMOVED Hardcoded URL ---
 const RECONNECT_DELAY = 5000; // 5 seconds
 
 // State variables
@@ -18,7 +26,7 @@ let reconnectTimeout: NodeJS.Timeout | null = null;
 
 // Callback registries
 let logCallbacks: LogCallback[] = [];
-let resultCallbacks: ResultCallback[] = [];
+let resultCallbacks: ResultCallback[] = []; // Type updated
 let errorCallbacks: ErrorCallback[] = [];
 let statusCallbacks: StatusCallback[] = [];
 
@@ -130,17 +138,38 @@ function connect() {
                     break;
                 case 'result':
                     console.log("[websocket.ts] Handling 'result' message. Payload:", message.payload);
-                    console.log(`[websocket.ts] Notifying ${resultCallbacks.length} result listeners.`);
-                    // Notify listeners *before* updating status
-                    resultCallbacks.forEach(cb => cb(message.payload));
-                    console.log("[websocket.ts] Calling updateStatus('connected') after result.");
-                    updateStatus('connected'); // Set status back to connected (and isProcessing to false)
+                    // --- START: Validate and handle new result structure ---
+                    if (message.payload && typeof message.payload === 'object' &&
+                        message.payload.json_data && typeof message.payload.json_data === 'object' &&
+                        Array.isArray(message.payload.json_data.concepts) &&
+                        Array.isArray(message.payload.json_data.relations) &&
+                        typeof message.payload.raw_xmi === 'string')
+                    {
+                        console.log(`[websocket.ts] Notifying ${resultCallbacks.length} result listeners.`);
+                        // Notify listeners *before* updating status
+                        resultCallbacks.forEach(cb => cb(message.payload as ResultPayload)); // Cast to the defined interface
+                        console.log("[websocket.ts] Calling updateStatus('connected') after result.");
+                        updateStatus('connected'); // Set status back to connected (and isProcessing to false)
+                    } else {
+                        console.error("[websocket.ts] Received 'result' message with unexpected payload structure:", message.payload);
+                        errorCallbacks.forEach(cb => cb("Received invalid result data structure from server."));
+                        updateStatus('error');
+                    }
+                    // --- END: Validate and handle new result structure ---
                     break;
                 case 'error':
                     console.log("[websocket.ts] Handling 'error' message.");
                     errorCallbacks.forEach(cb => cb(message.payload));
                     updateStatus('error'); // Show error status (and set isProcessing to false)
                     break;
+                // --- START: Handle OWL Result (if needed elsewhere, keep it) ---
+                case 'owl_result':
+                    console.log("[websocket.ts] Handling 'owl_result' message.");
+                    // You might want a dedicated callback for this or handle it differently
+                    // For now, just logging it.
+                    // owlResultCallbacks.forEach(cb => cb(message.payload));
+                    break;
+                // --- END: Handle OWL Result ---
                 default:
                     console.warn("Received unknown message type:", message.type);
             }
@@ -232,12 +261,12 @@ export const wsManager = {
         }
     },
 
-    // Subscription methods (Keep as they were)
+    // Subscription methods
     onLog: (callback: LogCallback) => {
         logCallbacks.push(callback);
         return () => { logCallbacks = logCallbacks.filter(cb => cb !== callback); };
     },
-    onResult: (callback: ResultCallback) => {
+    onResult: (callback: ResultCallback) => { // Type updated
         resultCallbacks.push(callback);
          return () => { resultCallbacks = resultCallbacks.filter(cb => cb !== callback); };
     },

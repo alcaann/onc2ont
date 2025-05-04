@@ -1,0 +1,374 @@
+---
+// frontend/src/components/OutputViewer.astro (Complete with xml-formatter)
+import { Icon } from 'astro-icon/components';
+---
+<div class="output-viewer-section"> {/* Renamed class */}
+    <div class="output-viewer-header"> {/* Renamed class */}
+        <h2>Processed Output</h2>
+        <div class="output-controls"> {/* Renamed class */}
+            {/* Keep IDs for now, or rename them too if desired (requires JS update) */}
+            <button id="output-font-decrease-btn" title="Decrease Font Size" aria-label="Decrease Font Size"><Icon name="mdi:format-font-size-decrease" /></button>
+            <button id="output-font-increase-btn" title="Increase Font Size" aria-label="Increase Font Size"><Icon name="mdi:format-font-size-increase" /></button>
+            <button id="json-format-btn" title="Format JSON" aria-label="Format JSON"><Icon name="mdi:code-json" /></button> {/* Keep specific JSON controls */}
+            <button id="json-update-graph-btn" title="Update Graph from JSON" aria-label="Update Graph from JSON"><Icon name="mdi:refresh" /></button>
+            <button id="json-save-btn" title="Save JSON" aria-label="Save JSON"><Icon name="mdi:content-save" /></button>
+        </div>
+    </div>
+
+    {/* --- Tab Buttons --- */}
+    <div class="tab-buttons">
+        <button id="tab-btn-json" class="tab-button active" data-tab="json">JSON Editor</button>
+        <button id="tab-btn-xmi" class="tab-button" data-tab="xmi">Raw XMI</button>
+    </div>
+
+    {/* --- Tab Content Panes --- */}
+    <div id="tab-content-json" class="tab-content active">
+        {/* Container where CodeMirror will mount */}
+        <div id="json-editor-container"></div> {/* Keep specific ID for JSON editor */}
+    </div>
+    <div id="tab-content-xmi" class="tab-content">
+        {/* Container for Raw XMI */}
+        <pre id="raw-xmi-container"></pre>
+    </div>
+</div>
+
+<script>
+    import { EditorView, basicSetup } from "codemirror";
+    import { EditorState } from "@codemirror/state";
+    import { json, jsonParseLinter } from "@codemirror/lang-json";
+    import { linter, lintGutter } from "@codemirror/lint";
+    import { wsManager } from '../lib/websocket';
+    import formatXml from 'xml-formatter'; // <-- Import xml-formatter
+
+    // --- Elements ---
+    const editorContainer = document.getElementById('json-editor-container'); // Keep specific ID
+    const rawXmiContainer = document.getElementById('raw-xmi-container') as HTMLPreElement | null;
+    // Use new IDs for font buttons if changed above, otherwise keep old ones
+    const increaseBtn = document.getElementById('output-font-increase-btn') as HTMLButtonElement | null;
+    const decreaseBtn = document.getElementById('output-font-decrease-btn') as HTMLButtonElement | null;
+    const formatBtn = document.getElementById('json-format-btn') as HTMLButtonElement | null; // Keep specific JSON button IDs
+    const updateGraphBtn = document.getElementById('json-update-graph-btn') as HTMLButtonElement | null;
+    const saveBtn = document.getElementById('json-save-btn') as HTMLButtonElement | null;
+    const tabBtnJson = document.getElementById('tab-btn-json') as HTMLButtonElement | null;
+    const tabBtnXmi = document.getElementById('tab-btn-xmi') as HTMLButtonElement | null;
+    const tabContentJson = document.getElementById('tab-content-json');
+    const tabContentXmi = document.getElementById('tab-content-xmi');
+
+    // --- State & Config ---
+    const FONT_STEP = 0.1;
+    const MIN_FONT_SIZE = 0.7;
+    const MAX_FONT_SIZE = 1.6;
+    const INITIAL_FONT_SIZE = 0.9;
+    let currentFontSize = INITIAL_FONT_SIZE;
+    let editorView: EditorView | null = null;
+    let currentJsonData: object | null = null; // Store current JSON data
+
+    // --- Functions ---
+
+    function updateEditorContent(content: object | string) {
+        if (!editorView) return;
+        let jsonString = "";
+        if (typeof content === 'object') {
+            currentJsonData = content; // Store the object
+            try {
+                jsonString = JSON.stringify(content, null, 2); // Pretty print initially
+            } catch (e) {
+                console.error("Failed to stringify JSON:", e);
+                jsonString = "Error: Could not display JSON data.";
+                currentJsonData = null;
+            }
+        } else if (typeof content === 'string') {
+            // If it's already a string, try to parse and re-stringify for formatting consistency
+            // and store the parsed object
+            try {
+                currentJsonData = JSON.parse(content);
+                jsonString = JSON.stringify(currentJsonData, null, 2);
+            } catch (e) {
+                // If parsing fails, display the raw string but clear stored object
+                console.warn("Received string is not valid JSON, displaying as is.");
+                jsonString = content;
+                currentJsonData = null;
+            }
+        }
+
+        const transaction = editorView.state.update({
+            changes: { from: 0, to: editorView.state.doc.length, insert: jsonString }
+        });
+        editorView.dispatch(transaction);
+    }
+
+    function formatJsonContent() {
+        if (!editorView || currentJsonData === null) {
+            console.warn("Cannot format: No valid JSON data available in editor.");
+            // Optionally try to format the current text content if currentJsonData is null
+            if (editorView) {
+                try {
+                    const currentText = editorView.state.doc.toString();
+                    const parsed = JSON.parse(currentText);
+                    const formatted = JSON.stringify(parsed, null, 2);
+                    const transaction = editorView.state.update({
+                        changes: { from: 0, to: editorView.state.doc.length, insert: formatted }
+                    });
+                    editorView.dispatch(transaction);
+                    currentJsonData = parsed; // Update stored data after successful format
+                } catch (e) {
+                    console.error("Failed to format current editor content:", e);
+                    // Maybe show a user notification?
+                }
+            }
+            return;
+        }
+        // If we have stored data, use that for reliable formatting
+        try {
+            const formattedJson = JSON.stringify(currentJsonData, null, 2);
+            const transaction = editorView.state.update({
+                changes: { from: 0, to: editorView.state.doc.length, insert: formattedJson }
+            });
+            editorView.dispatch(transaction);
+        } catch (e) {
+            console.error("Failed to format stored JSON data:", e);
+        }
+    }
+
+    function updateEditorFontSize(newSize: number) {
+        // Apply font size to the container, CodeMirror will inherit
+        // Use the specific JSON editor container ID
+        const jsonEditorElement = document.getElementById('json-editor-container');
+        if (jsonEditorElement) {
+             jsonEditorElement.style.fontSize = `${currentFontSize}em`;
+        }
+
+        currentFontSize = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, newSize));
+
+        // Also apply to XMI container for consistency
+        if (rawXmiContainer) {
+            rawXmiContainer.style.fontSize = `${currentFontSize}em`;
+        }
+        // Disable buttons at limits
+        if (increaseBtn) increaseBtn.disabled = currentFontSize >= MAX_FONT_SIZE;
+        if (decreaseBtn) decreaseBtn.disabled = currentFontSize <= MIN_FONT_SIZE;
+    }
+
+
+    function handleUpdateGraphClick() {
+        if (!editorView) return;
+        try {
+            const currentContent = editorView.state.doc.toString();
+            const jsonData = JSON.parse(currentContent); // Validate JSON before sending
+            // Dispatch custom event for GraphVisualizer to listen to
+            const event = new CustomEvent('update-graph', { detail: jsonData });
+            window.dispatchEvent(event);
+            console.log("Dispatched update-graph event with current JSON editor data.");
+        } catch (error) {
+            console.error("Invalid JSON in editor. Cannot update graph:", error);
+            alert("The content in the JSON editor is not valid JSON. Please correct it before updating the graph.");
+        }
+    }
+
+    function handleSaveJsonClick() {
+        if (!editorView) return;
+        try {
+            const currentContent = editorView.state.doc.toString();
+            // Attempt to parse to ensure it's valid before saving
+            JSON.parse(currentContent);
+            const blob = new Blob([currentContent], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'processed_output.json';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            console.log("JSON content saved.");
+        } catch (error) {
+            console.error("Invalid JSON in editor. Cannot save:", error);
+            alert("The content in the JSON editor is not valid JSON. Cannot save.");
+        }
+    }
+
+    // --- Tab Switching Logic ---
+    function switchTab(tabName: 'json' | 'xmi') {
+        if (!tabContentJson || !tabContentXmi || !tabBtnJson || !tabBtnXmi) return;
+
+        if (tabName === 'json') {
+            tabContentJson.classList.add('active');
+            tabContentXmi.classList.remove('active');
+            tabBtnJson.classList.add('active');
+            tabBtnXmi.classList.remove('active');
+            // Ensure editor refreshes if it was hidden
+            if (editorView) editorView.requestMeasure();
+        } else { // 'xmi'
+            tabContentJson.classList.remove('active');
+            tabContentXmi.classList.add('active');
+            tabBtnJson.classList.remove('active');
+            tabBtnXmi.classList.add('active');
+        }
+        console.log(`Switched to ${tabName} tab`);
+    }
+
+    // --- Initial Setup ---
+    function initializeEditor() {
+        if (!editorContainer) { // Use specific ID
+            console.error("JSON editor container (#json-editor-container) not found!");
+            return;
+        }
+
+        // Ensure container is empty before initializing
+        editorContainer.innerHTML = '';
+
+        try {
+            const startState = EditorState.create({
+                doc: "{\n  \"concepts\": [],\n  \"relations\": []\n}",
+                extensions: [
+                    basicSetup,
+                    json(),
+                    linter(jsonParseLinter()),
+                    lintGutter(),
+                    EditorView.lineWrapping // Enable line wrapping
+                ]
+            });
+
+            editorView = new EditorView({
+                state: startState,
+                parent: editorContainer // Mount in the specific container
+            });
+
+            // Set initial font size
+            updateEditorFontSize(INITIAL_FONT_SIZE);
+
+            console.log("CodeMirror JSON editor initialized.");
+
+        } catch (error) {
+            console.error("Failed to initialize CodeMirror:", error);
+            editorContainer.textContent = "Error initializing JSON editor.";
+        }
+    }
+
+    // --- Event Listeners ---
+    if (increaseBtn) increaseBtn.onclick = () => updateEditorFontSize(currentFontSize + FONT_STEP);
+    if (decreaseBtn) decreaseBtn.onclick = () => updateEditorFontSize(currentFontSize - FONT_STEP);
+    if (formatBtn) formatBtn.onclick = formatJsonContent;
+    if (updateGraphBtn) updateGraphBtn.onclick = handleUpdateGraphClick;
+    if (saveBtn) saveBtn.onclick = handleSaveJsonClick;
+
+    // Tab button listeners
+    if (tabBtnJson) tabBtnJson.onclick = () => switchTab('json');
+    if (tabBtnXmi) tabBtnXmi.onclick = () => switchTab('xmi');
+
+    // WebSocket listener for results
+    wsManager.onResult((data) => {
+        console.log("OutputViewer received result via WebSocket:", data);
+        // Update JSON Editor
+        updateEditorContent(data.json_data || { concepts: [], relations: [] }); // Pass the json_data part
+
+        // Update Raw XMI View
+        if (rawXmiContainer) {
+            const rawXmi = data.raw_xmi || "No XMI data received.";
+            try {
+                // Pretty-print the XMI using xml-formatter
+                const formattedXmi = formatXml(rawXmi, {
+                    indentation: '  ', // Use 2 spaces for indentation
+                    collapseContent: true, // Collapse tags with no content to <tag/>
+                    lineSeparator: '\n' // Use standard newline character
+                });
+                rawXmiContainer.textContent = formattedXmi;
+            } catch (e) {
+                console.error("Failed to format XMI:", e);
+                // Fallback to showing raw XMI if formatting fails
+                rawXmiContainer.textContent = rawXmi;
+            }
+        } else {
+            console.warn("Raw XMI container not found.");
+        }
+        // Optionally switch back to JSON tab automatically on new result?
+        // switchTab('json');
+    });
+
+    // Initialize editor after the DOM is ready
+    // Use setTimeout to ensure the container is definitely rendered
+    setTimeout(initializeEditor, 0);
+
+</script>
+
+{/* Styles are now mostly in global.css, keep specific overrides if needed */}
+<style is:global>
+    /* Styles specific to OutputViewer that shouldn't be global can go here */
+    /* Ensure the section itself allows content to grow */
+    .output-viewer-section { /* Renamed class */
+        /* display: flex; flex-direction: column; flex-grow: 1; */ /* Already set globally */
+        /* min-height: 0; overflow: hidden; */ /* Already set globally */
+    }
+
+    /* Keep styles for CodeMirror container if they need to be scoped */
+    #json-editor-container {
+      flex-grow: 1;
+      min-height: 150px;
+      overflow: hidden;
+      max-height: 50vh;
+      /* font-size is set dynamically via JS */
+    }
+    #json-editor-container .cm-editor {
+      height: 100%;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+    #json-editor-container .cm-scroller {
+      overflow-y: scroll;
+      height: 100%;
+    }
+
+    /* Keep styles for XMI container if they need to be scoped */
+     #raw-xmi-container {
+        flex-grow: 1;
+        background-color: #f8f8f8;
+        color: #333;
+        font-family: 'Courier New', Courier, monospace;
+        /* font-size is set dynamically via JS */
+        padding: 0.8rem;
+        overflow: scroll; /* Keep scroll for potentially long formatted output */
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        white-space: pre-wrap; /* Keep wrapping */
+        word-break: break-all; /* Keep breaking long words */
+        min-height: 150px;
+        max-height: 50vh;
+    }
+
+    /* Keep tab styles here if preferred, or rely on global.css */
+    .tab-buttons {
+        display: flex;
+        border-bottom: 1px solid #ccc;
+        margin-bottom: 0.5rem;
+        flex-shrink: 0;
+    }
+    .tab-button {
+        padding: 0.5rem 1rem;
+        cursor: pointer;
+        border: none;
+        background-color: transparent;
+        border-bottom: 2px solid transparent;
+        margin-bottom: -1px;
+        font-size: 0.9em;
+        color: #555;
+    }
+    .tab-button:hover {
+        background-color: #f0f0f0;
+        color: #000;
+    }
+    .tab-button.active {
+        border-bottom: 2px solid var(--theme-primary, #007bff);
+        font-weight: bold;
+        color: #000;
+    }
+    .tab-content {
+        display: none;
+        flex-grow: 1;
+        min-height: 0;
+        flex-direction: column;
+    }
+    .tab-content.active {
+        display: flex;
+    }
+
+</style>

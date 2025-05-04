@@ -1,24 +1,24 @@
 ---
-// frontend/src/layouts/MainLayout.astro (REVISED for 4 components)
+// frontend/src/layouts/MainLayout.astro (REVISED for OutputViewer)
 import '../styles/global.css';
 
 interface Props {
-	title: string;
+    title: string;
 }
 
 const { title } = Astro.props;
 ---
 <!doctype html>
 <html lang="en">
-	<head>
-		<meta charset="UTF-8" />
-		<meta name="description" content="Oncology Phrase Processor" />
-		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-		<meta name="generator" content={Astro.generator} />
-		<title>{title}</title>
-	</head>
-	<body>
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="description" content="Oncology Phrase Processor" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+        <meta name="generator" content={Astro.generator} />
+        <title>{title}</title>
+    </head>
+    <body>
     <div class="app-container">
       <header class="header-area">
         <h1>{title}</h1>
@@ -35,15 +35,15 @@ const { title } = Astro.props;
         </div>
       </div>
 
-      {/* BOTTOM Row: Logs and JSON Editor */}
+      {/* BOTTOM Row: Logs and Output Viewer */}
       <div class="content-row-wrap-bottom">
         <div class="logs-area">
           <slot name="logs" />
         </div>
-        <div class="json-editor-area">
-          <slot name="json-editor" /> {/* New slot */}
+        <div class="output-viewer-area"> {/* Renamed class */}
+          <slot name="output-viewer" /> {/* Renamed slot */}
         </div>
       </div>
     </div>
-	</body>
+    </body>
 </html>

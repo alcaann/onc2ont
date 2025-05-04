@@ -1,4 +1,4 @@
-/* frontend/src/styles/global.css (COMPLETE & FINAL - Always Show Scrollbars) */
+/* frontend/src/styles/global.css (REVISED for OutputViewer + XMI Wrap) */
 
 /* --- Basic Reset / Box Sizing --- */
 *, *::before, *::after {
@@ -39,6 +39,14 @@ h2 { font-size: 1.2em; }
 
 .header-area {
   flex-shrink: 0; /* Prevent header shrinking */
+  display: flex; /* Align title and status */
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 0.5rem; /* Add some space below header */
+  border-bottom: 1px solid #e0e0e0; /* Optional separator */
+}
+.header-area h1 {
+  margin-bottom: 0; /* Remove bottom margin from h1 in header */
 }
 
 /* --- Flex Row Wrappers --- */
@@ -56,7 +64,7 @@ h2 { font-size: 1.2em; }
 .input-area,
 .graph-area,
 .logs-area,
-.json-editor-area {
+.output-viewer-area { /* Renamed from json-editor-area */
   flex: 1 1 400px; /* Grow 1, Shrink 1, Basis 400px */
   display: flex;
   flex-direction: column;
@@ -66,14 +74,14 @@ h2 { font-size: 1.2em; }
 .input-area { min-height: 300px; }
 .graph-area { min-height: 350px; }
 .logs-area { min-height: 200px; }
-.json-editor-area { min-height: 250px; }
+.output-viewer-area { min-height: 250px; } /* Renamed from json-editor-area */
 
 
 /* --- Style for individual component sections --- */
 .input-section,
 .log-section,
 .graph-section,
-.json-editor-section {
+.output-viewer-section { /* Renamed from json-editor-section */
   background-color: #ffffff;
   padding: 1rem;
   border-radius: 8px;
@@ -99,9 +107,9 @@ h2 { font-size: 1.2em; }
   resize: vertical;
 }
 
-/* --- Log Console Specific --- */
-.log-header, /* Header within log section */
-.json-editor-header { /* Header within json section */
+/* --- Log Console & Output Viewer Headers --- */
+.log-header,
+.output-viewer-header { /* Renamed from json-editor-header */
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -109,10 +117,11 @@ h2 { font-size: 1.2em; }
   flex-shrink: 0; /* Prevent header shrinking */
 }
 .log-header h2,
-.json-editor-header h2 {
+.output-viewer-header h2 { /* Renamed from json-editor-header */
   margin-bottom: 0;
 }
 
+/* --- Log Console Specific --- */
 .log-console { /* The <pre> tag */
   flex-grow: 1;
   max-height: 40vh; /* Limit height */
@@ -121,10 +130,10 @@ h2 { font-size: 1.2em; }
   font-family: 'Courier New', Courier, monospace;
   font-size: 0.9em;
   padding: 0.8rem;
-  overflow-y: scroll; /* <<< CHANGED from auto to scroll */
+  overflow-y: scroll; /* Always show scrollbar */
   border-radius: 4px;
-  white-space: pre-wrap;
-  word-wrap: break-word;
+  white-space: pre-wrap; /* Allow wrapping */
+  word-wrap: break-word; /* Ensure long words break */
 }
 
 /* --- Graph Visualizer Specific --- */
@@ -137,34 +146,99 @@ h2 { font-size: 1.2em; }
   border-radius: 4px;
 }
 
-/* --- JSON Editor Specific --- */
-#json-editor-container {
+/* --- Output Viewer Specific (JSON Editor & XMI Viewer) --- */
+
+/* --- Tab Styles (within Output Viewer) --- */
+.output-viewer-section .tab-buttons { /* Scope to viewer */
+    display: flex;
+    border-bottom: 1px solid #ccc;
+    margin-bottom: 0.5rem; /* Space between tabs and content */
+    flex-shrink: 0; /* Prevent shrinking */
+}
+
+.output-viewer-section .tab-button { /* Scope to viewer */
+    padding: 0.5rem 1rem;
+    cursor: pointer;
+    border: none;
+    background-color: transparent;
+    border-bottom: 2px solid transparent; /* Placeholder for active indicator */
+    margin-bottom: -1px; /* Overlap border-bottom */
+    font-size: 0.9em;
+    color: #555;
+}
+
+.output-viewer-section .tab-button:hover { /* Scope to viewer */
+    background-color: #f0f0f0;
+    color: #000;
+}
+
+.output-viewer-section .tab-button.active { /* Scope to viewer */
+    border-bottom: 2px solid var(--theme-primary, #007bff); /* Use theme color or default */
+    font-weight: bold;
+    color: #000;
+}
+
+/* --- Tab Content Styles (within Output Viewer) --- */
+.output-viewer-section .tab-content { /* Scope to viewer */
+    display: none; /* Hide inactive tabs */
+    flex-grow: 1; /* Allow content to fill space */
+    min-height: 0; /* Allow shrinking */
+    flex-direction: column; /* Make it a flex container */
+}
+
+.output-viewer-section .tab-content.active { /* Scope to viewer */
+    display: flex; /* Show active tab - use flex to allow children to grow */
+}
+
+/* --- Raw XMI Container Style (within Output Viewer) --- */
+.output-viewer-section #raw-xmi-container { /* Scope to viewer */
+    flex-grow: 1; /* Take available space */
+    background-color: #f8f8f8; /* Light background */
+    color: #333;
+    font-family: 'Courier New', Courier, monospace;
+    /* font-size is set dynamically via JS */
+    padding: 0.8rem;
+    overflow: scroll; /* Allow both vertical and horizontal scroll if needed */
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    /* --- MODIFIED --- */
+    white-space: pre-wrap; /* Preserve whitespace AND wrap lines */
+    word-break: break-all; /* Force break even for long unbroken strings (like URLs in XMI) */
+    /* --- END MODIFIED --- */
+    min-height: 150px; /* Ensure minimum height */
+    max-height: 50vh; /* Match JSON editor max height */
+}
+
+/* --- JSON Editor Container (within Output Viewer tab) --- */
+.output-viewer-section #json-editor-container { /* Scope to viewer */
   flex-grow: 1; /* Editor container grows */
   min-height: 150px;
   overflow: hidden; /* Container doesn't scroll */
   max-height: 50vh; /* Max height */
+  /* font-size is set dynamically via JS */
 }
-#json-editor-container .cm-editor { /* CodeMirror main element */
+.output-viewer-section #json-editor-container .cm-editor { /* Scope to viewer */
   height: 100%; /* Fill the container */
-  font-size: 0.9em;
   border: 1px solid #ccc;
   border-radius: 4px;
 }
-#json-editor-container .cm-scroller { /* CodeMirror scrolling element */
-  overflow-y: scroll; /* <<< CHANGED from auto to scroll */
+.output-viewer-section #json-editor-container .cm-scroller { /* Scope to viewer */
+  overflow-y: scroll; /* Always show scrollbar */
   height: 100%; /* Ensure scroller tries to take full height */
 }
 
 
 /* --- Status Indicator --- */
 .status-indicator {
-  margin-top: 5px;
   font-size: 0.85em;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  text-align: center;
 }
-.status-connected { color: green; }
-.status-disconnected { color: red; }
-.status-processing { color: orange; }
-.status-error { color: darkred; font-weight: bold;}
+.status-connected { color: #2e7d32; background-color: #e8f5e9; border: 1px solid #a5d6a7;}
+.status-disconnected { color: #c62828; background-color: #ffebee; border: 1px solid #ef9a9a;}
+.status-processing { color: #ef6c00; background-color: #fff3e0; border: 1px solid #ffcc80;}
+.status-error { color: #c62828; background-color: #ffebee; border: 1px solid #ef9a9a; font-weight: bold;}
 
 /* --- Cytoscape Tooltip Style --- */
 #cy-tooltip {
@@ -191,7 +265,7 @@ h2 { font-size: 1.2em; }
   gap: 0.5rem;
 }
 .log-controls,
-.json-controls { /* Controls inside headers */
+.output-controls { /* Renamed from json-controls */
   z-index: 10;
   display: flex;
   gap: 0.5rem;
@@ -201,7 +275,7 @@ h2 { font-size: 1.2em; }
 .input-section button, /* Includes the main Process button */
 .graph-controls button,
 .log-controls button,
-.json-controls button {
+.output-controls button { /* Renamed from json-controls */
   background-color: rgba(255, 255, 255, 0.8); /* Default light background for icon buttons */
   border: 1px solid #ccc;
   border-radius: 4px;
@@ -227,7 +301,7 @@ h2 { font-size: 1.2em; }
 .input-section button:hover:not(:disabled),
 .graph-controls button:hover:not(:disabled),
 .log-controls button:hover:not(:disabled),
-.json-controls button:hover:not(:disabled) {
+.output-controls button:hover:not(:disabled) { /* Renamed from json-controls */
   background-color: rgba(240, 240, 240, 0.9); /* Default hover */
   border-color: #aaa;
 }
@@ -240,7 +314,7 @@ h2 { font-size: 1.2em; }
 .input-section button:disabled,
 .graph-controls button:disabled,
 .log-controls button:disabled,
-.json-controls button:disabled {
+.output-controls button:disabled { /* Renamed from json-controls */
   cursor: not-allowed;
   opacity: 0.5;
   background-color: #cccccc; /* Consistent disabled background */
@@ -251,7 +325,9 @@ h2 { font-size: 1.2em; }
 .input-section button .icon,
 .graph-controls button .icon,
 .log-controls button .icon,
-.json-controls button .icon {
+.output-controls button .icon { /* Renamed from json-controls */
   display: block; /* Astro-icon usually handles this */
+  width: 1.2em; /* Ensure icons have a consistent size */
+  height: 1.2em;
 }
 /* --- END CSS --- */

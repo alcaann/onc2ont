@@ -1,8 +1,6 @@
 # FILE: docker-compose.yml
 # (Replace the content of your existing file with this)
 
-version: '3.8'
-
 networks:
   umls_net:
     driver: bridge

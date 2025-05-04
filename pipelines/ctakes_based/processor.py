@@ -1,11 +1,10 @@
 # FILE: pipelines/ctakes_based/processor.py
-# (Updated Version - Removed Basic Auth Logic)
+# (Corrected Version - Fixed get_semantic_types_for_cui call and return type)
 
 import os
 import logging
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional, Callable, Tuple # Added Tuple
 import requests
-# Removed: from requests.auth import HTTPBasicAuth
 from lxml import etree # Using lxml for robust XML parsing
 
 from pipelines.base_pipeline import BaseProcessingPipeline
@@ -31,12 +30,12 @@ NS_MAP = {
 class CTakesPipeline(BaseProcessingPipeline):
     """
     Processing pipeline that interacts with the internal cTAKES Wrapper API service.
-    Sends text to the wrapper, receives XMI, and parses it.
+    Sends text to the wrapper, receives XMI, parses it, and returns JSON + raw XMI.
     """
     def __init__(self):
         # Get the URL of the internal wrapper API service from environment variables
         self.ctakes_url = os.getenv("CTAKES_URL") # e.g., http://ctakes_wrapper:8081/process
-        self.target_ontology_sab = os.getenv("TARGET_ONTOLOGY_SAB", "NCI")
+        # Removed target_ontology_sab as it's not used in get_semantic_types_for_cui
 
         if not self.ctakes_url:
             logger.critical("CTAKES_URL environment variable not set. CTakesPipeline cannot function.")
@@ -63,7 +62,8 @@ class CTakesPipeline(BaseProcessingPipeline):
             except Exception as e:
                 logger.error(f"Error calling log_func: {e}", exc_info=False)
 
-    def process(self, phrase: str, log_func: Optional[Callable[[str], None]] = None) -> Dict[str, List[Dict[str, Any]]]:
+    # --- MODIFIED RETURN TYPE ---
+    def process(self, phrase: str, log_func: Optional[Callable[[str], None]] = None) -> Tuple[Dict[str, List[Dict[str, Any]]], str]:
         """
         Processes the input phrase by calling the internal cTAKES Wrapper API service.
 
@@ -72,22 +72,25 @@ class CTakesPipeline(BaseProcessingPipeline):
             log_func: Optional callback function for streaming logs.
 
         Returns:
-            A dictionary containing 'concepts' and 'relations' lists per BaseProcessingPipeline interface.
+            A tuple containing:
+            1. A dictionary with 'concepts' and 'relations' lists.
+            2. The raw XMI content as a string.
+            Returns ({'concepts': [], 'relations': []}, "") on error.
         """
         self._log(f"Processing phrase via Wrapper API (first 50 chars): '{phrase[:50]}...'", log_func)
         final_concepts: List[Dict[str, Any]] = []
         final_relations: List[Dict[str, Any]] = []
+        xmi_content_str: str = "" # Initialize raw XMI string
 
         if not phrase or not phrase.strip():
             self._log("Input phrase is empty or whitespace only. Skipping cTAKES wrapper call.", log_func)
-            return {'concepts': [], 'relations': []}
+            return {'concepts': [], 'relations': []}, ""
 
         try:
             self._log(f"Sending phrase to cTAKES Wrapper API at {self.ctakes_url}", log_func)
             response = self.session.post(
                 self.ctakes_url,
                 data=phrase.encode('utf-8'), # Send raw text encoded as bytes
-                # Removed: auth=self.auth, # No auth needed for wrapper API call
                 timeout=120 # Increase timeout significantly, as wrapper waits for cTAKES file processing
             )
             self._log(f"Received response from Wrapper API (Status: {response.status_code}, Encoding: {response.encoding})", log_func)
@@ -95,27 +98,42 @@ class CTakesPipeline(BaseProcessingPipeline):
             # Check for successful response from the WRAPPER API
             response.raise_for_status() # Raise HTTPError for 4xx/5xx from the wrapper
 
-            # --- XMI Parsing (remains the same) ---
-            xmi_content = response.content # Wrapper returns raw XMI bytes
-            if not xmi_content:
+            # --- XMI Parsing ---
+            xmi_content_bytes = response.content # Wrapper returns raw XMI bytes
+            if not xmi_content_bytes:
                  self._log("Received empty XMI content from Wrapper API.", log_func)
-                 return {'concepts': [], 'relations': []}
+                 return {'concepts': [], 'relations': []}, ""
 
+            # --- Store raw XMI as string ---
             try:
-                root = etree.fromstring(xmi_content)
+                # Attempt to decode using response encoding, fallback to utf-8
+                encoding = response.encoding if response.encoding else 'utf-8'
+                xmi_content_str = xmi_content_bytes.decode(encoding)
+            except UnicodeDecodeError:
+                self._log(f"Warning: Could not decode XMI using {encoding}, trying utf-8 with errors ignored.", log_func)
+                xmi_content_str = xmi_content_bytes.decode('utf-8', errors='ignore')
+            except Exception as decode_err:
+                 self._log(f"Error decoding XMI content: {decode_err}. Proceeding with empty XMI string.", log_func)
+                 xmi_content_str = "" # Ensure it's an empty string on error
+
+            # --- Parse XMI for concepts/relations ---
+            try:
+                # Use the bytes directly for lxml parsing
+                root = etree.fromstring(xmi_content_bytes)
                 self._log("Successfully parsed XMI response from Wrapper API.", log_func)
             except etree.XMLSyntaxError as xml_err:
                  self._log(f"Failed to parse XMI response received from wrapper: {xml_err}", log_func)
-                 return {'concepts': [], 'relations': []}
+                 # Return empty results but include the potentially malformed XMI string for debugging
+                 return {'concepts': [], 'relations': []}, xmi_content_str
 
-            # Get Sofa string (remains the same)
+            # Get Sofa string
             sofa_element = root.find('.//cas:Sofa', namespaces=NS_MAP)
             if sofa_element is None or 'sofaString' not in sofa_element.attrib:
                 self._log("Critical error: cas:Sofa element/sofaString attribute not found in received XMI.", log_func)
-                return {'concepts': [], 'relations': []}
+                return {'concepts': [], 'relations': []}, xmi_content_str
             sofa_string = sofa_element.attrib['sofaString']
 
-            # --- Efficiently store UmlsConcepts by their xmi:id (remains the same) ---
+            # --- Efficiently store UmlsConcepts by their xmi:id ---
             xmi_id_attr = f'{{{NS_MAP["xmi"]}}}id'
             umls_concepts_by_id = {
                 uc.attrib.get(xmi_id_attr): uc
@@ -125,7 +143,7 @@ class CTakesPipeline(BaseProcessingPipeline):
             if not umls_concepts_by_id:
                  self._log("Warning: No refsem:UmlsConcept elements found in received XMI.", log_func)
 
-            # --- Concept Extraction (remains the same logic) ---
+            # --- Concept Extraction ---
             mention_tags_to_process = [
                 'textsem:DiseaseDisorderMention', 'textsem:SignSymptomMention',
                 'textsem:ProcedureMention', 'textsem:AnatomicalSiteMention',
@@ -160,9 +178,13 @@ class CTakesPipeline(BaseProcessingPipeline):
                                         cuis.append(cui)
                                         if primary_cui is None: primary_cui = cui
                         if not primary_cui: continue
+
                         sem_types = []
                         try:
-                            sem_types = get_semantic_types_for_cui(primary_cui, self.target_ontology_sab)
+                            # --- CORRECTED CALL: Removed second argument ---
+                            sem_types = get_semantic_types_for_cui(primary_cui)
+                        except TypeError as type_err: # Catch the specific error we saw
+                            self._log(f"DB Call TypeError for CUI {primary_cui}: {type_err}. Check db_utils.get_semantic_types_for_cui signature.", log_func)
                         except Exception as db_err:
                             self._log(f"DB Error fetching types for CUI {primary_cui}: {db_err}", log_func)
 
@@ -188,10 +210,8 @@ class CTakesPipeline(BaseProcessingPipeline):
             final_concepts.sort(key=lambda x: x['start_char'])
             self._log(f"Extracted {len(final_concepts)} concepts from received XMI.", log_func)
 
-            # --- Relation Extraction (remains the same logic) ---
-            # This logic still depends on whether the cTAKES pipeline run by the wrapper
-            # was configured to produce relation annotations in the XMI.
-            relation_elements = root.xpath('.//relation:BinaryTextRelation', namespaces=NS_MAP)
+            # --- Relation Extraction ---
+            relation_elements = root.xpath('.//relation:LocationOfTextRelation', namespaces=NS_MAP)
             if relation_elements:
                 self._log(f"Found {len(relation_elements)} relation elements in received XMI.", log_func)
                 concepts_by_mention_id = {c['mention_id']: c for c in final_concepts}
@@ -199,17 +219,28 @@ class CTakesPipeline(BaseProcessingPipeline):
                     try:
                         rel_category = rel_element.attrib.get('category', 'UNKNOWN_RELATION')
                         rel_id = rel_element.attrib.get(xmi_id_attr, 'N/A')
-                        args = rel_element.xpath('./relation:arguments/relation:RelationArgument', namespaces=NS_MAP)
-                        subject_mention_id = None
-                        object_mention_id = None
-                        if len(args) == 2:
-                            target1_id = args[0].attrib.get('target')
-                            target2_id = args[1].attrib.get('target')
-                            if target1_id and target2_id:
-                                subject_mention_id = target1_id
-                                object_mention_id = target2_id
+
+                                                # Get arg1 and arg2 attributes directly from the relation element
+                        arg1_ref = rel_element.attrib.get('arg1')
+                        arg2_ref = rel_element.attrib.get('arg2')
+
+                        subject_relation_arg = None
+                        object_relation_arg = None
+
+                        if arg1_ref and arg2_ref:
+                            # Find the corresponding RelationArgument elements using their xmi:id
+                            arg1_element = root.xpath(f'.//relation:RelationArgument[@xmi:id="{arg1_ref}"]', namespaces=NS_MAP)
+                            arg2_element = root.xpath(f'.//relation:RelationArgument[@xmi:id="{arg2_ref}"]', namespaces=NS_MAP)
+
+                            if arg1_element and arg2_element:
+                                # Get the 'argument' attribute which points to the actual concept mention's xmi:id
+                                subject_mention_id = arg1_element[0].attrib.get('argument')
+                                object_mention_id = arg2_element[0].attrib.get('argument')
+                            else:
+                                self._log(f"Could not find RelationArgument elements for relation (ID: {rel_id}) args: {arg1_ref}, {arg2_ref}. Skipping.", log_func)
+                                continue
                         else:
-                             self._log(f"Relation (ID: {rel_id}) in XMI doesn't have 2 arguments. Skipping.", log_func)
+                             self._log(f"Relation (ID: {rel_id}) in XMI missing arg1 or arg2 attribute. Skipping.", log_func)
                              continue
 
                         if subject_mention_id and object_mention_id:
@@ -232,31 +263,30 @@ class CTakesPipeline(BaseProcessingPipeline):
 
             self._log(f"Extracted {len(final_relations)} relations from received XMI.", log_func)
 
-        # --- Error Handling (remains largely the same, targets Wrapper API interaction) ---
+        # --- Error Handling ---
         except requests.exceptions.Timeout:
             self._log("Request to cTAKES Wrapper API timed out.", log_func)
-            return {'concepts': [], 'relations': []}
+            return {'concepts': [], 'relations': []}, "" # Return empty tuple
         except requests.exceptions.HTTPError as http_err:
-            # Handle HTTP errors returned BY THE WRAPPER API (e.g., 500 if cTAKES failed internally)
             self._log(f"HTTP error calling Wrapper API: {http_err.response.status_code} - {http_err.response.reason}", log_func)
             try:
                  error_body = http_err.response.text
                  self._log(f"Wrapper API Error Response Body (first 500 chars): {error_body[:500]}", log_func)
+                 xmi_content_str = f"Error from Wrapper: {error_body}" # Include error in XMI string if possible
             except Exception: pass
-            return {'concepts': [], 'relations': []}
+            return {'concepts': [], 'relations': []}, xmi_content_str # Return empty tuple + error string
         except requests.exceptions.RequestException as req_err:
-            # Handle network errors connecting TO the wrapper API
             self._log(f"Network error calling Wrapper API: {req_err}", log_func)
-            return {'concepts': [], 'relations': []}
+            return {'concepts': [], 'relations': []}, "" # Return empty tuple
         except ImportError as imp_err:
              logger.critical(f"Import error, likely missing db_utils or dependency: {imp_err}", exc_info=True)
              self._log(f"Server configuration error: {imp_err}", log_func)
-             return {'concepts': [], 'relations': []}
+             return {'concepts': [], 'relations': []}, "" # Return empty tuple
         except Exception as e:
-            # Catch-all for unexpected errors in THIS processor (e.g., XMI parsing, DB call)
             logger.exception("An unexpected error occurred in CTakesPipeline.process:")
             self._log(f"An unexpected processing error occurred: {e}", log_func)
-            return {'concepts': [], 'relations': []}
+            return {'concepts': [], 'relations': []}, xmi_content_str # Return empty tuple + potentially partial XMI
 
-        # Return the final structured results
-        return {'concepts': final_concepts, 'relations': final_relations}
+        # --- CORRECTED RETURN: Return tuple (dict, str) ---
+        json_results = {'concepts': final_concepts, 'relations': final_relations}
+        return json_results, xmi_content_str

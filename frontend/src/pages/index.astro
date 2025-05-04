@@ -1,10 +1,10 @@
 ---
-// frontend/src/pages/index.astro (REVISED for 4 components)
+// frontend/src/pages/index.astro (REVISED for OutputViewer)
 import MainLayout from '../layouts/MainLayout.astro';
 import InputForm from '../components/InputForm.astro';
 import LogConsole from '../components/LogConsole.astro';
 import GraphVisualizer from '../components/GraphVisualizer.astro';
-import JsonEditor from '../components/JsonEditor.astro'; // Import new component
+import OutputViewer from '../components/OutputViewer.astro'; // Import renamed component
 ---
 <MainLayout title="Oncology Phrase Processor">
 
@@ -14,13 +14,13 @@ import JsonEditor from '../components/JsonEditor.astro'; // Import new component
 
   {/* --- Bottom Row --- */}
   <LogConsole slot="logs" />
-  <JsonEditor slot="json-editor" /> {/* Place in new slot */}
+  <OutputViewer slot="output-viewer" /> {/* Use new component and slot name */}
 
 </MainLayout>
 
 <style is:global>
  /* Ensure slot wrappers fill their parent flex areas */
- .input-area, .graph-area, .logs-area, .json-editor-area { /* Added json-editor-area */
+ .input-area, .graph-area, .logs-area, .output-viewer-area { /* Renamed json-editor-area */
     display: flex;
     flex-direction: column;
     min-height: 0;
