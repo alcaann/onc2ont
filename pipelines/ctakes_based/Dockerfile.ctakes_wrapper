@@ -36,7 +36,8 @@ ENV CTAKES_HOME=/opt/apache-ctakes-6.0.0
 RUN mkdir -p /app /ctakes_io/input /ctakes_io/output
 
 # Copy the wrapper API script
-COPY ./pipelines/ctakes_based/ctakes_wrapper_api.py /app/ctakes_wrapper_api.py
+COPY ctakes_wrapper_api.py /app/ctakes_wrapper_api.py
+
 
 # Install Python dependencies for the wrapper API using python3's pip
 RUN python3 -m pip install --no-cache-dir fastapi "uvicorn[standard]" python-dotenv lxml

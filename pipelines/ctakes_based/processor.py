@@ -1,5 +1,5 @@
 # FILE: pipelines/ctakes_based/processor.py
-# (Corrected Version - Fixed get_semantic_types_for_cui call and return type)
+# (REVISED - Removed DB call for semantic types)
 
 import os
 import logging
@@ -8,7 +8,8 @@ import requests
 from lxml import etree # Using lxml for robust XML parsing
 
 from pipelines.base_pipeline import BaseProcessingPipeline
-from scripts.db_utils import get_semantic_types_for_cui # Ensure this function exists and works
+# --- REMOVED DB UTILS IMPORT ---
+# from scripts.db_utils import get_semantic_types_for_cui
 
 # Configure logging for this module
 logger = logging.getLogger(__name__)
@@ -34,8 +35,8 @@ class CTakesPipeline(BaseProcessingPipeline):
     """
     def __init__(self):
         # Get the URL of the internal wrapper API service from environment variables
-        self.ctakes_url = os.getenv("CTAKES_URL") # e.g., http://ctakes_wrapper:8081/process
-        # Removed target_ontology_sab as it's not used in get_semantic_types_for_cui
+        self.ctakes_url = os.getenv("CTAKES_URL") # e.g., http://ctakes_wrapper:8001/process
+        # Removed target_ontology_sab as it's not used
 
         if not self.ctakes_url:
             logger.critical("CTAKES_URL environment variable not set. CTakesPipeline cannot function.")
@@ -62,7 +63,7 @@ class CTakesPipeline(BaseProcessingPipeline):
             except Exception as e:
                 logger.error(f"Error calling log_func: {e}", exc_info=False)
 
-    # --- MODIFIED RETURN TYPE ---
+    # --- MODIFIED RETURN TYPE in base_pipeline.py should match this ---
     def process(self, phrase: str, log_func: Optional[Callable[[str], None]] = None) -> Tuple[Dict[str, List[Dict[str, Any]]], str]:
         """
         Processes the input phrase by calling the internal cTAKES Wrapper API service.
@@ -179,19 +180,15 @@ class CTakesPipeline(BaseProcessingPipeline):
                                         if primary_cui is None: primary_cui = cui
                         if not primary_cui: continue
 
-                        sem_types = []
-                        try:
-                            # --- CORRECTED CALL: Removed second argument ---
-                            sem_types = get_semantic_types_for_cui(primary_cui)
-                        except TypeError as type_err: # Catch the specific error we saw
-                            self._log(f"DB Call TypeError for CUI {primary_cui}: {type_err}. Check db_utils.get_semantic_types_for_cui signature.", log_func)
-                        except Exception as db_err:
-                            self._log(f"DB Error fetching types for CUI {primary_cui}: {db_err}", log_func)
+                        # --- MODIFICATION START: Remove DB call for semantic types ---
+                        sem_types = [] # Initialize as empty list
+                        # Removed try...except block that called get_semantic_types_for_cui
+                        # --- MODIFICATION END ---
 
                         concept_dict = {
                             'mention_id': mention_id, 'cui': primary_cui, 'all_cuis': cuis,
                             'matched_term': matched_term, 'text_span': f"{begin}-{end}",
-                            'start_char': begin, 'end_char': end, 'sem_types': sem_types,
+                            'start_char': begin, 'end_char': end, 'sem_types': sem_types, # Use the empty list
                             'score': None, 'source': f"ctakes:{tag.split(':')[1]}",
                             'polarity': polarity, 'uncertainty': uncertainty, 'conditional': conditional,
                             'generic': generic, 'historyOf': historyOf,
@@ -211,6 +208,7 @@ class CTakesPipeline(BaseProcessingPipeline):
             self._log(f"Extracted {len(final_concepts)} concepts from received XMI.", log_func)
 
             # --- Relation Extraction ---
+            # Using LocationOfTextRelation based on previous findings
             relation_elements = root.xpath('.//relation:LocationOfTextRelation', namespaces=NS_MAP)
             if relation_elements:
                 self._log(f"Found {len(relation_elements)} relation elements in received XMI.", log_func)
@@ -220,12 +218,12 @@ class CTakesPipeline(BaseProcessingPipeline):
                         rel_category = rel_element.attrib.get('category', 'UNKNOWN_RELATION')
                         rel_id = rel_element.attrib.get(xmi_id_attr, 'N/A')
 
-                                                # Get arg1 and arg2 attributes directly from the relation element
+                        # Get arg1 and arg2 attributes directly from the relation element
                         arg1_ref = rel_element.attrib.get('arg1')
                         arg2_ref = rel_element.attrib.get('arg2')
 
-                        subject_relation_arg = None
-                        object_relation_arg = None
+                        subject_mention_id = None # Initialize
+                        object_mention_id = None # Initialize
 
                         if arg1_ref and arg2_ref:
                             # Find the corresponding RelationArgument elements using their xmi:id
@@ -251,15 +249,18 @@ class CTakesPipeline(BaseProcessingPipeline):
                                  }
                                  final_relations.append(relation_dict)
                              else:
-                                 self._log(f"Relation (ID: {rel_id}) links to non-extracted mentions. Skipping.", log_func)
+                                 # Log which specific mention ID was missing if lookup fails
+                                 missing_subj = "" if subject_mention_id in concepts_by_mention_id else f" Subject Mention ID: {subject_mention_id}"
+                                 missing_obj = "" if object_mention_id in concepts_by_mention_id else f" Object Mention ID: {object_mention_id}"
+                                 self._log(f"Relation (ID: {rel_id}) links to non-extracted mentions. Skipping.{missing_subj}{missing_obj}", log_func)
                         else:
-                             self._log(f"Could not extract arguments for relation (ID: {rel_id}).", log_func)
+                             self._log(f"Could not extract mention IDs from arguments for relation (ID: {rel_id}).", log_func)
                     except Exception as rel_err:
                         rel_id_err = rel_element.attrib.get(xmi_id_attr, 'N/A')
                         self._log(f"Error processing relation element (ID: {rel_id_err}): {rel_err}", log_func)
                         continue
             else:
-                 self._log("No relation elements found in received XMI.", log_func)
+                 self._log("No relation:LocationOfTextRelation elements found in received XMI.", log_func)
 
             self._log(f"Extracted {len(final_relations)} relations from received XMI.", log_func)
 
@@ -278,15 +279,14 @@ class CTakesPipeline(BaseProcessingPipeline):
         except requests.exceptions.RequestException as req_err:
             self._log(f"Network error calling Wrapper API: {req_err}", log_func)
             return {'concepts': [], 'relations': []}, "" # Return empty tuple
-        except ImportError as imp_err:
-             logger.critical(f"Import error, likely missing db_utils or dependency: {imp_err}", exc_info=True)
-             self._log(f"Server configuration error: {imp_err}", log_func)
-             return {'concepts': [], 'relations': []}, "" # Return empty tuple
+        # Removed ImportError catch specific to db_utils
         except Exception as e:
             logger.exception("An unexpected error occurred in CTakesPipeline.process:")
             self._log(f"An unexpected processing error occurred: {e}", log_func)
             return {'concepts': [], 'relations': []}, xmi_content_str # Return empty tuple + potentially partial XMI
 
-        # --- CORRECTED RETURN: Return tuple (dict, str) ---
+        # --- Return tuple (dict, str) ---
         json_results = {'concepts': final_concepts, 'relations': final_relations}
         return json_results, xmi_content_str
+
+# --- END OF pipelines/ctakes_based/processor.py ---

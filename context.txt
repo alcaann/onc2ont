@@ -2,89 +2,73 @@
 
 **Project Goal:** Develop an AI pipeline for a thesis that takes short oncology patient phrases as input, processes them using **Apache cTAKES 6.0.0**, and outputs:
 1.  A standardized **JSON** structure containing extracted **NCI Thesaurus (NCIt)** concepts and relationships suitable for a web application frontend.
-2.  An **OWL 2** representation of the extracted information, compatible with tools like Protégé, using NCIt concepts where possible.
+2.  **(Removed Goal):** An OWL 2 representation of the extracted information.
 
 **Environment & System Architecture:**
 
 1.  **Dockerized Environment:** Fully containerized using Docker Compose (`docker-compose.yml`). Runs via `docker compose up -d` after `docker compose build`.
-    *   `db`: PostgreSQL 15 (`umls_postgres_db`), persistent data (`postgres_data`). Contains UMLS subset (`MRCONSO`, `MRSTY`, `MRREL`) including **NCI Thesaurus (SAB='NCI')**. `pg_trgm` enabled. Port 5432 mapped to host 5433. Runs on internal `umls_net` network. Healthcheck enabled.
-    *   **`ctakes_wrapper`**: Custom-built service (`umls_ctakes_wrapper_service`) based on `pipelines/ctakes_based/Dockerfile.ctakes_wrapper`.
+    *   **`ctakes_wrapper`**: Custom-built service based on `pipelines/ctakes_based/Dockerfile.ctakes_wrapper`.
         *   Runs on a **Java 17** base image (`eclipse-temurin:17-jre-jammy`) with Python 3 installed.
-        *   **Mounts** the local host directory `./pipelines/ctakes_based/apache-ctakes-6.0.0` to `/opt/apache-ctakes-6.0.0` inside the container as **read-write** (necessary for HSQLDB lock files).
+        *   **Mounts** the local host directory `./pipelines/ctakes_based/apache-ctakes-6.0.0` to `/opt/apache-ctakes-6.0.0` inside the container as **read-write**.
         *   Runs a lightweight **FastAPI application (`pipelines/ctakes_based/ctakes_wrapper_api.py`)** on internal port `8081`.
-        *   Receives the **UMLS API Key** via the `UMLS_API_KEY` environment variable (passed from `.env` via `docker-compose.yml`).
-        *   Exposes a `/process` endpoint that:
-            *   Receives raw text via POST.
-            *   Writes the text to a temporary input file.
-            *   Executes the cTAKES **file-based pipeline** (using `org.apache.ctakes.core.pipeline.PiperFileRunner` via `java -cp ...`) targeting the input file and a temporary output directory. Passes the `UMLS_API_KEY` using the `--key` argument (verified).
-            *   Waits for cTAKES to complete.
-            *   Reads the resulting `.xmi` file from the temporary output directory.
-            *   Returns the raw XMI content in the HTTP response.
-            *   Cleans up temporary files.
-        *   Includes a `/health` endpoint used by its Dockerfile `HEALTHCHECK`. Runs on `umls_net` network.
-    *   `app`: Backend Python 3.10 (`umls_processor_app`). Runs FastAPI API via Uvicorn on internal port 8000.
-        *   Provides WebSocket endpoint (`/ws`). Uses volume mounts for hot-reloading (`./api:/app/api`, etc.).
-        *   Connects to `db` service (`DB_HOST=db`).
-        *   Connects to the **`ctakes_wrapper`** service using the URL specified by `CTAKES_URL` (e.g., `http://ctakes_wrapper:8081/process`).
-        *   Dynamically loads and runs the configured pipeline class (currently `CTakesPipeline`).
-        *   Responsible for calling the `ctakes_wrapper` API, parsing the returned XMI, querying the local `db` for NCI semantic types, formatting JSON, triggering OWL generation, and communicating results via WebSocket.
-        *   Runs on `umls_net` network. Depends on healthy `db` and `ctakes_wrapper`.
-    *   `frontend`: Nginx (`umls_frontend_nginx`). Serves static Astro frontend assets. Maps host port **8080** to container port 80. Proxies WebSocket requests (`/ws`) to the `app` service. Runs on `umls_net` network. Depends on `app`.
+        *   Receives the **UMLS API Key** via the `UMLS_API_KEY` environment variable.
+        *   Exposes a `/process` endpoint that starts a new Java cTAKES process for each request.
+        *   Includes a `/health` endpoint.
+        *   Uses an `asyncio.Lock` to process requests sequentially.
+    *   `app`: Backend Python 3.10. Runs FastAPI API via Uvicorn on internal port 8000.
+        *   Provides WebSocket endpoint (`/ws`). Uses volume mounts for hot-reloading.
+        *   Connects to the **`ctakes_wrapper`** service using `CTAKES_URL`.
+        *   Dynamically loads and runs the configured pipeline class (`PROCESSING_PIPELINE` env var).
+        *   Responsible for calling the wrapper, parsing XMI, formatting JSON, and communicating via WebSocket.
+        *   Depends on a healthy `ctakes_wrapper`.
+    *   `frontend`: Nginx. Serves static Astro frontend assets. Maps host port **8080** to container port 80. Proxies WebSocket requests (`/ws`) to the `app` service. Depends on `app`.
 
 2.  **Data Handling & Status:**
-    *   **UMLS Subset:** Loaded and queryable in PostgreSQL `db` service. Used by `app` service to fetch semantic types (`MRSTY` where `SAB='NCI'`) for concepts identified by cTAKES. Potentially used later for relation extraction (querying `MRREL`).
-    *   **cTAKES 6.0.0 Distribution:** Located on the host machine at `./pipelines/ctakes_based/apache-ctakes-6.0.0` and mounted read-write into the `ctakes_wrapper` container. Includes required binaries, libraries, resources, and pipeline descriptors (`.piper` files, found under `resources/` in this version).
-    *   **UMLS Authentication:** Handled via **API Key** (`UMLS_API_KEY` in `.env`), passed to the `ctakes_wrapper` container, which passes it to the cTAKES `PiperFileRunner` using the `--key` argument.
+    *   **cTAKES 6.0.0 Distribution:** Mounted read-write into the `ctakes_wrapper` container from `./pipelines/ctakes_based/apache-ctakes-6.0.0`.
+    *   **UMLS Authentication:** Handled via **API Key** (`UMLS_API_KEY` in `.env`), passed to the `ctakes_wrapper` container, which passes it to the cTAKES `PiperFileRunner`.
 
 **Core Backend Pipeline Architecture:**
 
 Modular via `BaseProcessingPipeline` ABC (`pipelines/base_pipeline.py`).
 
 1.  **Primary Implementation (`pipelines/ctakes_based/processor.py`):**
-    *   `CTakesPipeline(BaseProcessingPipeline)` class.
-    *   **Initialization (`__init__`)**: Stores the `ctakes_wrapper` service URL (`CTAKES_URL` env var). Initializes a `requests.Session`. No direct authentication logic needed here.
-    *   **`process` Method Implementation:**
-        *   Takes `phrase` and `log_func`.
-        *   Sends `phrase` via HTTP POST to the `ctakes_wrapper` service URL. Handles timeouts and HTTP errors from the wrapper.
-        *   Receives **raw XMI** content in the response body (`response.content`).
-        *   **Parses XMI:** Uses `lxml` library to process the received XMI string. Extracts `cas:Sofa` string.
-        *   **Extracts Concepts (Mentions):** Iterates through relevant `textsem:*Mention` elements. Extracts `xmi:id`, `begin`, `end`, `polarity`, `uncertainty`, etc. Looks up corresponding `refsem:UmlsConcept` elements via `ontologyConceptArr` to get CUI(s). Selects primary CUI.
-        *   **Fetches SemTypes:** Uses primary CUI and `TARGET_ONTOLOGY_SAB` ('NCI') to query the local `db` via `scripts.db_utils.get_semantic_types_for_cui`.
-        *   Formats results into the standard `'concepts'` list structure defined in `BaseProcessingPipeline`.
-        *   **Extracts Relations (Placeholder):** Attempts to find and parse `relation:BinaryTextRelation` elements if present in the XMI. Formats into the standard `'relations'` list. **Currently expects this list to be empty as the default cTAKES pipeline (`DefaultFastPipeline.piper`) likely doesn't perform relation extraction.**
-        *   Returns `{'concepts': final_concepts, 'relations': final_relations}` dictionary.
-
+    *   `CTakesPipeline(BaseProcessingPipeline)` class. Calls the `ctakes_wrapper` API, parses XMI, extracts concepts/relations.
 2.  **API Integration (`api/main.py`):**
-    *   Loads `.env` variables.
-    *   Dynamically imports and instantiates the pipeline class specified by `PROCESSING_PIPELINE` env var on startup. Handles loading errors.
-    *   WebSocket endpoint (`/ws`):
-        *   Accepts connection only if pipeline loaded successfully.
-        *   Receives `{'type': 'process_phrase', ...}` message.
-        *   Manages async tasks for processing, logging, and OWL generation.
-        *   Calls `processing_pipeline.process(phrase, log_func=log_callback_sync)` in a separate thread.
-        *   Receives the JSON `result` dictionary.
-        *   Sends JSON result to frontend: `{type: 'result', ...}`.
-        *   **Triggers OWL Generation:** Calls `scripts.owl_generator.generate_owl(result['concepts'], result['relations'])` in a separate thread.
-        *   Sends OWL result string to frontend: `{type: 'owl_result', ...}`. Handles errors during OWL generation.
+    *   Loads pipeline, handles WebSocket communication, calls the pipeline's `process` method.
 
-3.  **OWL Generation (`scripts/owl_generator.py`):**
-    *   Uses `rdflib` library.
-    *   Defines namespaces (custom `MYNS`, `NCIT`, `RO`, standard RDF/RDFS/OWL/XSD).
-    *   Maps extracted `concepts` (mentions) to `owl:NamedIndividual` instances.
-    *   Maps concept CUIs to `owl:Class` instances (using `MYNS` or potentially `NCIT` namespace).
-    *   Adds `rdf:type` assertions linking individuals to their classes.
-    *   Adds data properties (defined in `MYNS`) to individuals based on extracted mention details (span, polarity, source, CUI, etc.).
-    *   Maps extracted `relations` (if any) using a `DEFAULT_RELATION_MAP` (prioritizing standard `RO` properties) to create `owl:ObjectProperty` assertions between individuals.
-    *   Serializes the final RDF graph to **OWL 2 RDF/XML format** using `g.serialize(format='pretty-xml')`.
+**(OWL Generation Removed)**
+
+**Python Function Summaries:**
+
+*   **`pipelines/base_pipeline.py`**
+    *   `BaseProcessingPipeline(ABC)`: Abstract base class for processing pipelines.
+        *   `__init__(self, **kwargs)`: Constructor (can be overridden).
+        *   `process(self, phrase: str, log_func: Callable[[str], None]) -> Tuple[Dict[str, List[Dict[str, Any]]], str]`: Abstract method to process a phrase and return JSON results and raw output (e.g., XMI).
+
+*   **`pipelines/ctakes_based/processor.py`**
+    *   `CTakesPipeline(BaseProcessingPipeline)`: Implements processing using the cTAKES wrapper API.
+        *   `__init__(self, ctakes_url: str, timeout: int = 120)`: Initializes with wrapper URL and request timeout.
+        *   `process(self, phrase: str, log_func: Callable[[str], None]) -> Tuple[Dict[str, List[Dict[str, Any]]], str]`: Sends phrase to wrapper, receives/parses XMI, extracts concepts/relations, returns JSON and raw XMI.
+        *   `_extract_concepts(self, root: 'etree._Element', sofa_string: str, log_func: Callable[[str], None]) -> List[Dict[str, Any]]`: Helper to extract concept mentions from parsed XMI.
+        *   `_extract_relations(self, root: 'etree._Element', concepts_map: Dict[str, Dict[str, Any]], log_func: Callable[[str], None]) -> List[Dict[str, Any]]`: Helper to extract relations from parsed XMI.
+
+*   **`pipelines/ctakes_based/ctakes_wrapper_api.py`**
+    *   `process_text(text: str = Body(..., media_type='text/plain')) -> PlainTextResponse`: FastAPI endpoint (`/process`). Receives text, runs cTAKES via `subprocess.run`, saves history, returns raw XMI. Uses `asyncio.Lock`.
+    *   `health_check() -> JSONResponse`: FastAPI endpoint (`/health`). Checks prerequisites and returns status.
+
+*   **`api/main.py`**
+    *   `load_pipeline() -> Optional[BaseProcessingPipeline]`: Dynamically imports and instantiates the pipeline class specified by `PROCESSING_PIPELINE` env var.
+    *   `read_root() -> HTMLResponse`: FastAPI endpoint (`/`). Returns simple HTML status page.
+    *   `websocket_endpoint(websocket: WebSocket)`: FastAPI WebSocket endpoint (`/ws`). Handles connection, message reception (`process_phrase`), calls pipeline processing in a thread, sends results (`log`, `result`, `error`) back to client.
+    *   `process_phrase_task(websocket: WebSocket, data: Dict[str, Any], log_callback_async: Callable[[str], Coroutine[Any, Any, None]])`: Async task to manage the processing of a single phrase, calling the pipeline and sending results/errors.
+    *   `log_callback_sync(message: str)`: Synchronous callback passed to the pipeline's `process` method to queue log messages for async sending.
 
 **Frontend Application (Astro):**
 
 *   Communicates via WebSocket managed by `frontend/src/lib/websocket.ts`.
-*   Receives `'log'`, `'result'` (JSON), `'owl_result'`, and `'error'` messages.
-*   `GraphVisualizer.astro` uses Cytoscape.js to display the graph based on the `'result'` payload.
-*   Other components display logs (`LogConsole.astro`), allow JSON editing (`JsonEditor.astro`), and handle input (`InputForm.astro`).
+*   Receives `'log'`, `'result'` (containing `json_data` and `raw_xmi`), and `'error'` messages.
 
-**Folder Structure & File Descriptions (Relevant Additions/Changes):**
+**Folder Structure & File Descriptions (Detailed):**
 
 ```
 .
@@ -92,57 +76,75 @@ Modular via `BaseProcessingPipeline` ABC (`pipelines/base_pipeline.py`).
 │   ├── ctakes_based/
 │   │   ├── __init__.py
 │   │   ├── apache-ctakes-6.0.0/    # <-- Local cTAKES files (Mounted, not in image)
-│   │   ├── ctakes_wrapper_api.py   # <-- NEW: FastAPI wrapper script
-│   │   ├── Dockerfile.ctakes_wrapper # <-- NEW: Dockerfile for wrapper service
+│   │   ├── ctakes_wrapper_api.py   # <-- FastAPI wrapper script (starts Java process per request)
+│   │   ├── Dockerfile.ctakes_wrapper # <-- Dockerfile for wrapper service
 │   │   └── processor.py            # <-- Pipeline class calling the wrapper API
-│   ├── spacy_rule_based/           # (Alternative pipeline, unchanged)
-│   └── base_pipeline.py          # (Interface definition, docstring updated)
-├── scripts/
-│   ├── owl_generator.py          # <-- NEW: Generates OWL output
-│   └── db_utils.py               # (DB interaction functions)
+│   └── base_pipeline.py          # (Interface definition)
 ├── api/
-│   └── main.py                   # (FastAPI, WebSocket, dynamic pipeline loading, triggers OWL)
-├── .env                          # <-- Contains UMLS_API_KEY and other secrets
-├── .env.example                  # <-- Example environment variables
-├── docker-compose.yml            # (Defines db, ctakes_wrapper, app, frontend services)
+│   └── main.py                   # (FastAPI, WebSocket, dynamic pipeline loading)
+├── frontend/                     # (Astro frontend application)
+│   ├── public/                   # (Static assets, e.g., favicon)
+│   │   └── favicon.svg
+│   ├── src/
+│   │   ├── components/           # (Reusable Astro/UI components)
+│   │   │   ├── HeaderInfo.astro  # (Likely displays title and status)
+│   │   │   ├── InputForm.astro   # (Text area and submit button)
+│   │   │   ├── LogConsole.astro  # (Displays processing logs)
+│   │   │   ├── GraphVisualizer.astro # (Displays Cytoscape graph)
+│   │   │   └── OutputViewer.astro # (Tabbed view for JSON and Raw XMI)
+│   │   ├── layouts/              # (Overall page structure)
+│   │   │   └── Layout.astro      # (Main HTML layout, includes head, body)
+│   │   ├── pages/                # (Application pages/routes)
+│   │   │   └── index.astro       # (Main page, imports and arranges components)
+│   │   ├── lib/                  # (JavaScript/TypeScript modules)
+│   │   │   └── websocket.ts      # (Manages WebSocket connection and communication)
+│   │   └── styles/               # (CSS styles)
+│   │       └── global.css        # (Global application styles)
+│   ├── astro.config.mjs          # (Astro configuration file)
+│   ├── Dockerfile                # (Builds the Nginx image for frontend)
+│   ├── nginx.conf                # (Nginx configuration, including WS proxy)
+│   ├── package.json              # (Frontend Node.js dependencies)
+│   ├── package-lock.json
+│   ├── tsconfig.json             # (TypeScript configuration)
+│   └── README.md                 # (Frontend specific README)
+├── .env                          # <-- Contains UMLS_API_KEY, PROCESSING_PIPELINE, CTAKES_URL etc.
+├── .env.example
+├── docker-compose.yml            # (Defines ctakes_wrapper, app, frontend services)
 ├── Dockerfile                    # (Builds the 'app' service)
-└── requirements.txt              # (Added requests, lxml, rdflib)
+├── entrypoint.sh                 # (Entrypoint for 'app' service)
+├── requirements.txt              # (Python dependencies for 'app' service)
+├── .dockerignore                 # (Specifies files/dirs to ignore during Docker build)
+├── context.txt                   # (This file)
+└── README.md                     # (Main project README)
 ```
 
 **Current Status & Achievements:**
 
-*   Stable Docker environment with orchestrated services (`db`, `ctakes_wrapper`, `app`, `frontend`).
-*   UMLS subset loaded and queryable via `scripts/db_utils.py`.
-*   Successfully integrated **file-based cTAKES 6.0.0 execution** via a custom internal wrapper API (`ctakes_wrapper` service).
+*   Stable Docker environment with orchestrated services (`ctakes_wrapper`, `app`, `frontend`).
+*   Successfully integrated **file-based cTAKES 6.0.0 execution** via a custom internal wrapper API. Manual execution inside the container confirms cTAKES pipeline works.
 *   cTAKES authentication handled via **UMLS API Key**.
-*   cTAKES Java version mismatch resolved (using Java 17).
-*   Volume mount permissions issue resolved (using read-write mount).
-*   Backend `CTakesPipeline` successfully calls the wrapper, receives XMI, and parses it (basic execution flow works without fatal errors).
+*   Backend `CTakesPipeline` successfully calls the wrapper, receives XMI, and parses it.
 *   Backend API dynamically loads the selected pipeline.
-*   Basic structure for OWL 2 generation using `rdflib` is in place (`scripts/owl_generator.py`).
-*   Frontend application is functional for input/output display via WebSockets.
+*   Frontend application connects via WebSocket and can send requests. Input/output display (JSON editor, raw XMI view, logs) is functional.
+*   End-to-end processing (Frontend -> App -> Wrapper -> cTAKES -> Wrapper -> App -> Frontend) is working.
 
 **Known Issues / Challenges:**
 
-1.  **Frontend Display:** Concepts successfully processed by the backend (likely present in the received XMI) are **not appearing** in the frontend knowledge graph. This suggests an issue in the data flow *after* XMI parsing: XMI parsing logic itself (`processor.py`), JSON formatting (`processor.py`), WebSocket transmission (`main.py`), or frontend data consumption/rendering (`GraphVisualizer.astro`).
-2.  **Relation Extraction:** The current setup uses a default cTAKES pipeline (`DefaultFastPipeline.piper`) which likely **does not perform relation extraction**. The `'relations'` list in the JSON/OWL output is expected to be empty. Implementing relation extraction is a major next step.
-3.  **OWL Relation Mapping:** The `DEFAULT_RELATION_MAP` in `owl_generator.py` needs to be populated with correct mappings once relation types are actually extracted.
-4.  **cTAKES Pipeline Tuning:** The `DefaultFastPipeline.piper` might not be optimal. Customizing the cTAKES pipeline could improve concept recognition or enable relation extraction but requires understanding cTAKES configuration.
-5.  **Error Handling Robustness:** Error handling in the wrapper API and main app could be further improved for edge cases.
+1.  **Performance Bottleneck:** The primary issue is the **significant delay/timeout** during processing due to the `ctakes_wrapper` starting a **new Java Virtual Machine (JVM) and initializing the entire cTAKES pipeline for every single request**.
+2.  **Frontend Concept Display:** (Verify if still an issue) Concepts might not be appearing in the frontend knowledge graph (`GraphVisualizer.astro`). Needs re-testing.
+3.  **Relation Extraction:** Current pipeline (`CustomPipeline.piper`) likely performs minimal relation extraction.
+4.  **cTAKES Pipeline Tuning:** The current `.piper` file might not be optimal.
+5.  **Error Handling Robustness:** Could be improved.
+6.  **Semantic Type Information:** Not currently extracted.
 
 **Next Milestones / Immediate Focus:**
 
-1.  **Debug Frontend Concept Display:**
-    *   Trace data: Add detailed logging in `CTakesPipeline.process` after XMI parsing to confirm concepts *are* being extracted into `final_concepts`.
-    *   Log the JSON payload *before* it's sent via WebSocket in `api/main.py`.
-    *   Use browser developer tools to inspect the actual WebSocket message received by the frontend.
-    *   Debug the `GraphVisualizer.astro` component's client-side script to see why it isn't rendering nodes based on the received `concepts` data.
-2.  **Plan Relation Extraction Strategy:**
-    *   **Option A (cTAKES):** Research cTAKES 6.0.0 relation extraction components (e.g., coreference, dependency parsing + relation annotators). Investigate how to modify/create a `.piper` file to include these and configure the `ctakes_wrapper` to use the new pipeline. Assess feasibility and complexity.
-    *   **Option B (Post-processing):** Keep the cTAKES pipeline for NER only. Implement relation extraction logic within the `CTakesPipeline.process` method (in `app`) after getting concepts from XMI. This could use rules (dependency-based, keyword-based) or knowledge base lookups (querying `MRREL` in the local DB).
-    *   **Option C (Hybrid):** Use cTAKES for some relations (e.g., anatomical locations) and post-processing for others.
-3.  **Implement Chosen Relation Extraction:** Add the necessary code based on the chosen strategy.
-4.  **Refine OWL Generation:** Update `owl_generator.py` with correct relation property mappings and ensure output conforms to OWL 2 standards and project requirements.
-5.  **Thesis Writing & Documentation:** Document the final architecture, implementation details, cTAKES integration, OWL mapping, and results.
+1.  **Address Performance Bottleneck:**
+    *   **Short-term:** Increase request timeout in `processor.py`.
+    *   **Long-term (Crucial):** Re-architect cTAKES integration (e.g., UIMA AS, persistent wrapper process) to avoid per-request startup.
+2.  **Verify/Debug Frontend Concept Display:** Confirm if concepts render correctly now. Debug data flow if necessary.
+3.  **Plan Relation Extraction Strategy:** Decide on approach (cTAKES pipeline modification, post-processing, hybrid).
+4.  **Address Semantic Types:** Determine if needed and how to extract.
+5.  **Thesis Writing & Documentation:** Document architecture, implementation, performance, results.
 
 --- END OF UPDATED context.txt ---

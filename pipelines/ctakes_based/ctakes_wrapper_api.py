@@ -1,5 +1,5 @@
 # FILE: pipelines/ctakes_based/ctakes_wrapper_api.py
-# (Complete Code - Attempt 8 - Adding Timestamp to History Folder Name)
+# (Complete Code - Includes subprocess output capturing and logging)
 
 import asyncio
 import logging
@@ -7,9 +7,11 @@ import os
 import subprocess
 import tempfile
 import uuid
+import time # Added for timing
+import traceback # Added for exception formatting
 from pathlib import Path
 from typing import Optional
-from datetime import datetime # Import datetime
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import PlainTextResponse, JSONResponse
@@ -48,9 +50,9 @@ elif not CTAKES_LIB_DIR.is_dir() or not CTAKES_RESOURCES_DIR.is_dir() or not CTA
     startup_error_detail = f"Cannot find essential cTAKES directories (lib, resources, desc) in {CTAKES_HOME}."
 elif not log4j_config_path.is_file():
      logger.warning(f"Log4j configuration file not found at {log4j_config_path}. cTAKES logging may use defaults or be absent.")
-     CTAKES_EXECUTABLE_PATH = "PiperFileRunner"
+     CTAKES_EXECUTABLE_PATH = "PiperFileRunner" # Assume PiperFileRunner even without log4j
 else:
-     CTAKES_EXECUTABLE_PATH = "PiperFileRunner"
+     CTAKES_EXECUTABLE_PATH = "PiperFileRunner" # Assume PiperFileRunner
 
 if not CTAKES_EXECUTABLE_PATH and not startup_error_detail:
     startup_error_detail = "Failed to determine cTAKES execution method."
@@ -80,7 +82,7 @@ ctakes_lock = asyncio.Lock() # Lock to ensure sequential processing
 
 @app.post("/process", response_class=PlainTextResponse)
 async def process_text(text: str = Body(..., media_type='text/plain')):
-    """ Processes text using file-based cTAKES and saves input/output to a timestamped history folder. """
+    """ Processes text using file-based cTAKES and saves input/output/logs to a timestamped history folder. """
     run_id = str(uuid.uuid4())
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S") # Format: YYYYMMDD_HHMMSS
     history_folder_name = f"{timestamp_str}_{run_id}" # New folder name format
@@ -112,29 +114,26 @@ async def process_text(text: str = Body(..., media_type='text/plain')):
         logger.info(f"{log_prefix} Saved input text to: {input_history_file}")
     except OSError as e:
         logger.warning(f"{log_prefix} Failed to create history directory or save input: {e}. Processing will continue.")
-        history_run_dir = None # Disable output saving if input saving failed
+        history_run_dir = None # Disable output/log saving if input saving failed
     except Exception as e_hist:
         logger.warning(f"{log_prefix} Unexpected error saving input history: {e_hist}. Processing will continue.")
-        history_run_dir = None # Disable output saving
+        history_run_dir = None # Disable output/log saving
     # --- End History Saving Setup ---
 
     async with ctakes_lock:
         try:
             logger.info(f"{log_prefix} Processing request.")
             # 1. Create temporary input file
-            # Use a unique name based on the history folder name to avoid potential (though unlikely) collisions
-            # if multiple requests land in the exact same second before the lock.
-            temp_input_filename = f"{history_folder_name}.txt"
+            temp_input_filename = f"{history_folder_name}.txt" # Use unique name
+            # Use NamedTemporaryFile to ensure unique name even with same timestamp
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=INPUT_DIR, delete=False, suffix=".txt", prefix=f"{timestamp_str}_") as f:
-                input_file = Path(f.name) # Get the actual path used by NamedTemporaryFile
-                f.write(text) # Write the same text that was saved to history
+                input_file = Path(f.name)
+                f.write(text)
             logger.info(f"{log_prefix} Temporary input file: {input_file}")
 
             # 2. Prepare temporary output directory and expected output file path
-            # Use the history_folder_name for the temporary output subdir as well for consistency
             output_dir_run = OUTPUT_DIR / history_folder_name
             output_dir_run.mkdir(exist_ok=True)
-             # XMI file named after the final temporary input file name (without path)
             output_file = output_dir_run / f"{input_file.name}.xmi"
             logger.info(f"{log_prefix} Expecting temporary output: {output_file}")
 
@@ -159,24 +158,78 @@ async def process_text(text: str = Body(..., media_type='text/plain')):
                  raise HTTPException(status_code=500, detail="Internal Server Error: cTAKES execution method misconfigured.")
 
             logger.info(f"{log_prefix} Executing command: {' '.join(cmd)}")
+            start_time = time.time()
 
-            # 4. Run cTAKES subprocess
-            process = await asyncio.to_thread(
-                subprocess.run, cmd, capture_output=True, text=True, encoding='utf-8', check=False
-            )
+            # 4. Run cTAKES subprocess and capture output
+            try:
+                # --- MODIFIED SUBPROCESS CALL ---
+                process = await asyncio.to_thread(
+                    subprocess.run,
+                    cmd,
+                    check=False, # Don't raise exception on non-zero exit, we'll check returncode
+                    capture_output=True, # Capture stdout and stderr
+                    text=True, # Decode stdout/stderr as text
+                    encoding='utf-8', # Specify encoding
+                    errors='replace' # Handle potential decoding errors
+                )
+                # --- END MODIFICATION ---
 
-            # 5. Check result
-            stdout = process.stdout
-            stderr = process.stderr
-            logger.info(f"{log_prefix} cTAKES stdout (last 500 chars):\n...{stdout[-500:]}")
+                end_time = time.time()
+                duration = end_time - start_time
+                logger.info(f"{log_prefix} Subprocess finished in {duration:.2f} seconds with return code: {process.returncode}")
 
-            if process.returncode != 0:
-                logger.error(f"{log_prefix} cTAKES execution failed (Code {process.returncode})")
-                logger.error(f"{log_prefix} cTAKES stderr:\n{stderr}")
-                error_detail = f"cTAKES process failed (Code {process.returncode}). Stderr: {stderr[:1000]}..."
-                raise HTTPException(status_code=500, detail=error_detail)
-            else:
+                # --- ADD LOGGING FOR STDOUT/STDERR ---
+                stdout = process.stdout or "(empty)"
+                stderr = process.stderr or "(empty)"
+
+                logger.debug(f"{log_prefix} cTAKES stdout (last 1000 chars):\n...{stdout[-1000:]}")
+                logger.debug(f"{log_prefix} cTAKES stderr (last 2000 chars):\n...{stderr[-2000:]}")
+
+                # Save full stdout/stderr to history if possible
+                if history_run_dir:
+                    try:
+                        with open(history_run_dir / "ctakes_stdout.log", "w", encoding='utf-8') as f_stdout:
+                            f_stdout.write(stdout)
+                        with open(history_run_dir / "ctakes_stderr.log", "w", encoding='utf-8') as f_stderr:
+                            f_stderr.write(stderr)
+                        logger.info(f"{log_prefix} Saved full stdout/stderr to history directory.")
+                    except Exception as e_hist_log:
+                        logger.warning(f"{log_prefix} Failed to save stdout/stderr to history: {e_hist_log}")
+                # --- END LOGGING ADDITION ---
+
+                # 5. Check return code AFTER logging output
+                if process.returncode != 0:
+                    error_message = f"cTAKES execution failed with return code {process.returncode}."
+                    logger.error(f"{log_prefix} {error_message} See ctakes_stderr.log in history for details.")
+                    # Save error details also to a specific file if history dir exists
+                    if history_run_dir:
+                        try:
+                            with open(history_run_dir / "error.log", "w", encoding='utf-8') as f_err:
+                                f_err.write(f"{error_message}\n\nSTDERR:\n{stderr}")
+                        except Exception as e_hist_err:
+                             logger.warning(f"{log_prefix} Failed to save error details to history: {e_hist_err}")
+                    # Raise HTTPException for FastAPI
+                    raise HTTPException(status_code=500, detail=f"{error_message} Stderr (start): {stderr[:500]}...")
+
                 logger.info(f"{log_prefix} cTAKES execution successful.")
+
+            except FileNotFoundError:
+                logger.exception(f"{log_prefix} Error: 'java' command not found. Is Java installed and in PATH?")
+                raise HTTPException(status_code=500, detail="'java' command not found on server.")
+            except Exception as e_subproc:
+                logger.exception(f"{log_prefix} An unexpected error occurred during cTAKES subprocess execution: {e_subproc}")
+                # Save exception details if history dir exists
+                if history_run_dir:
+                    try:
+                        with open(history_run_dir / "error.log", "w", encoding='utf-8') as f_err:
+                            f_err.write(f"Python Exception during subprocess execution:\n{traceback.format_exc()}")
+                    except Exception as e_hist_py_err:
+                        logger.warning(f"{log_prefix} Failed to save Python exception details to history: {e_hist_py_err}")
+                # Re-raise if it's already an HTTPException, otherwise wrap it
+                if isinstance(e_subproc, HTTPException):
+                    raise
+                else:
+                    raise HTTPException(status_code=500, detail=f"Internal server error during cTAKES execution: {e_subproc}")
 
             # 6. Read output file
             if output_file.is_file():
@@ -201,14 +254,21 @@ async def process_text(text: str = Body(..., media_type='text/plain')):
                      raise HTTPException(status_code=500, detail=f"Failed to read cTAKES output file or save history: {read_err}")
             else:
                 logger.error(f"{log_prefix} Expected temporary output file NOT FOUND: {output_file}")
-                files_in_output = list(output_dir_run.glob('*'))
+                files_in_output = list(output_dir_run.glob('*')) if output_dir_run.exists() else []
                 logger.error(f"{log_prefix} Files found in temporary output dir ({output_dir_run}): {files_in_output}")
-                logger.error(f"{log_prefix} cTAKES stderr (for clues):\n{stderr}")
+                logger.error(f"{log_prefix} cTAKES stderr (for clues):\n{stderr}") # Log stderr again if output missing
                 raise HTTPException(status_code=500, detail=f"cTAKES completed but temporary output file not found: {output_file.name}")
 
-        except HTTPException: raise
+        except HTTPException: raise # Re-raise HTTPExceptions directly
         except Exception as e:
             logger.exception(f"{log_prefix} Unexpected error during processing:")
+            # Save general exception details if history dir exists
+            if history_run_dir:
+                try:
+                    with open(history_run_dir / "error.log", "w", encoding='utf-8') as f_err:
+                         f_err.write(f"General Python Exception during processing:\n{traceback.format_exc()}")
+                except Exception as e_hist_gen_err:
+                    logger.warning(f"{log_prefix} Failed to save general exception details to history: {e_hist_gen_err}")
             raise HTTPException(status_code=500, detail=f"Internal server error in wrapper: {e}")
         finally:
             # 7. Cleanup temporary files reliably (History files are NOT cleaned)
@@ -254,6 +314,7 @@ async def health_check():
          issues.append("Missing UMLS_API_KEY environment variable. UMLS lookups may fail.")
     if status != "ERROR":
         try:
+            # Test writability of history base directory
             test_file = HISTORY_BASE_DIR / f".healthcheck_{uuid.uuid4()}"
             test_file.touch()
             test_file.unlink()
